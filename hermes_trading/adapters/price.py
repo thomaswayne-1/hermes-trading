@@ -15,7 +15,20 @@ import httpx
 log = logging.getLogger("hermes.adapters.price")
 
 SCHEMA_VERSION = "1"
-BINANCE_BASE = "https://api.binance.com"
+
+# Binance.com is geo-blocked on US IPs (HTTP 451).
+# Binance.US is the compliant endpoint for US-hosted servers.
+# Kraken is the fallback if Binance.US also fails.
+BINANCE_US_BASE = "https://api.binance.us"
+KRAKEN_BASE = "https://api.kraken.com"
+
+# Map common tickers to Kraken pairs
+KRAKEN_PAIR_MAP = {
+    "BTC/USDT": "XBTUSD",
+    "ETH/USDT": "ETHUSD",
+    "SOL/USDT": "SOLUSD",
+    "BNB/USDT": "BNBUSD",
+}
 
 
 async def fetch(asset: str) -> dict[str, Any]:
@@ -23,12 +36,22 @@ async def fetch(asset: str) -> dict[str, Any]:
     Returns:
       schema_version, symbol, close, high, low, open, volume,
       rsi (14-period, calculated from last 15 closes), timestamp
+
+    Tries Binance.US first; falls back to Kraken on failure.
     """
+    try:
+        return await _fetch_binance_us(asset)
+    except Exception as exc:
+        log.warning("Binance.US failed (%s) — trying Kraken", exc)
+        return await _fetch_kraken(asset)
+
+
+async def _fetch_binance_us(asset: str) -> dict[str, Any]:
     symbol = asset.replace("/", "")  # BTC/USDT → BTCUSDT
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{BINANCE_BASE}/api/v3/klines",
+            f"{BINANCE_US_BASE}/api/v3/klines",
             params={"symbol": symbol, "interval": "1m", "limit": 15},
         )
         resp.raise_for_status()
@@ -52,6 +75,45 @@ async def fetch(asset: str) -> dict[str, Any]:
         "volume": volumes[-1],
         "rsi":    rsi,
         "timestamp": klines[-1][0],
+        "source": "binance_us",
+    }
+
+
+async def _fetch_kraken(asset: str) -> dict[str, Any]:
+    pair = KRAKEN_PAIR_MAP.get(asset, asset.replace("/", ""))
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{KRAKEN_BASE}/0/public/OHLC",
+            params={"pair": pair, "interval": 1},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    if data.get("error"):
+        raise ValueError(f"Kraken error: {data['error']}")
+
+    # Kraken returns {result: {PAIR: [[time,open,high,low,close,vwap,vol,count], ...]}}
+    result_key = [k for k in data["result"] if k != "last"][0]
+    candles = data["result"][result_key][-15:]  # last 15 candles
+
+    closes  = [float(c[4]) for c in candles]
+    opens   = [float(c[1]) for c in candles]
+    highs   = [float(c[2]) for c in candles]
+    lows    = [float(c[3]) for c in candles]
+    volumes = [float(c[6]) for c in candles]
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "symbol": asset,
+        "close":  closes[-1],
+        "open":   opens[-1],
+        "high":   highs[-1],
+        "low":    lows[-1],
+        "volume": volumes[-1],
+        "rsi":    _rsi14(closes),
+        "timestamp": int(candles[-1][0]) * 1000,
+        "source": "kraken",
     }
 
 

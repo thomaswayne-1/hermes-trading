@@ -28,7 +28,7 @@ def _fetch_sync(asset: str) -> dict[str, Any]:
     try:
         import yfinance as yf
         tickers = yf.download(
-            tickers="DX-Y.NYB VIX ^GSPC",
+            tickers="DX-Y.NYB ^VIX ^GSPC",
             period="2d",
             interval="1d",
             progress=False,
@@ -50,7 +50,7 @@ def _fetch_sync(asset: str) -> dict[str, Any]:
             "source": "yfinance",
             "asset": asset,
             "dxy_close":  last_close("DX-Y.NYB"),
-            "vix_close":  last_close("VIX"),
+            "vix_close":  last_close("^VIX"),
             "spx_close":  last_close("^GSPC"),
         }
     except Exception as exc:
