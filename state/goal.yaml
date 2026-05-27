@@ -1,0 +1,7 @@
+asset: "BTC/USDT"
+target_return_30d: 0.05      # success
+max_drawdown:      0.08      # failure
+min_sharpe:        1.4       # quality bar
+failure_below:     -0.04     # score floor — steeply negative below this
+reflection_every:  5         # cycle cadence
+one_variable_only: true      # scientific-method guardrail
