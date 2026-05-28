@@ -1,7 +1,13 @@
-version: "01"
+version: "03"
 entry:
   indicator: rsi
-  threshold: 30
+  threshold: 32               # buy when RSI drops below this (oversold)
   direction: long
-stop_loss_pct: 2.0
+  volume_surge_multiplier: 1.5  # only enter when volume ≥ 1.5x 20-bar average
+  rsi_exit_threshold: 70      # exit long when RSI hits overbought
+stop_loss_pct: 2.0            # hard stop: cut loss at -2%
+take_profit_pct: 4.0          # lock gains at +4%
+trailing_stop_pct: 1.5        # trail 1.5% below peak (locks profit on big moves)
+leverage: 2.0                 # 2x position size — doubles gains AND losses
+reentry_cooldown_minutes: 15  # wait 15 min after closing before next entry
 position_size_r: 0.5
