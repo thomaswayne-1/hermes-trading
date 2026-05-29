@@ -1,5 +1,10 @@
 """
 run.py — entrypoint for the Hermes trading worker.
+
+Starts two coroutines in parallel:
+  1. TradingLoop.run_forever()  — the trading engine
+  2. api.start_server()         — read-only HTTP state API (port $PORT)
+
 Reads asset from state/goal.yaml (override with --asset flag).
 """
 import argparse
@@ -12,6 +17,7 @@ from pathlib import Path
 import yaml
 
 from hermes_trading.loop import TradingLoop
+from hermes_trading.api import start_server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,10 +60,17 @@ def main() -> None:
             )
             sys.exit(1)
 
-    log.info("Booting hermes-trading worker | asset=%s mode=%s", asset, mode)
+    log.info("Booting hermes-trading | asset=%s mode=%s", asset, mode)
 
-    loop = TradingLoop(asset=asset, mode=mode, state_dir=STATE_DIR, goal=goal)
-    asyncio.run(loop.run_forever())
+    trading_loop = TradingLoop(asset=asset, mode=mode, state_dir=STATE_DIR, goal=goal)
+
+    async def run_all():
+        await asyncio.gather(
+            trading_loop.run_forever(),
+            start_server(),
+        )
+
+    asyncio.run(run_all())
 
 
 if __name__ == "__main__":
