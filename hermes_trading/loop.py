@@ -1,7 +1,7 @@
 """
 loop.py — 24/7 async reliability loop.
 
-Every 60 s:
+Every 10 s:
   1. Pull data from all adapters (with per-adapter retries + circuit-breaker).
   2. Load current strategy from state/strategy.yaml.
   3. Evaluate entry / exit conditions.
@@ -10,19 +10,36 @@ Every 60 s:
   6. Write heartbeat to state/heartbeat.json.
 
 Strategy variables honoured:
-  entry.threshold              RSI level to trigger entry
-  entry.direction              long / short
-  entry.volume_surge_multiplier  min ratio of current vol to 20-bar avg (0 = disabled)
-  entry.rsi_exit_threshold     exit long when RSI rises above this (overbought)
-  stop_loss_pct                hard stop, % from entry
-  take_profit_pct              hard take-profit, % from entry
-  trailing_stop_pct            trailing stop from peak price (0 = disabled)
-  leverage                     position multiplier (e.g. 2.0 = 2x)
-  reentry_cooldown_minutes     minutes to wait after a closed trade before re-entering
+  entry.direction                  long / short / both
+  entry.long_threshold             enter long when RSI < this
+  entry.short_threshold            enter short when RSI > this
+  entry.long_rsi_exit              exit long when RSI > this
+  entry.short_rsi_exit             exit short when RSI < this
+  entry.macd_confirm               if true, MACD hist direction adds +1 to score
+  entry.bb_confirm                 if true, BB %B position adds +1 to score
+  entry.ob_confirm                 if true, order-book imbalance adds +1 to score
+  entry.volume_surge_multiplier    min ratio of current vol to 20-bar avg (0 = disabled)
+  stop_loss_pct                    hard stop, % from entry
+  take_profit_pct                  hard take-profit, % from entry  (fixed mode)
+  take_profit_mode                 'fixed' or 'atr'
+  take_profit_atr_multiplier       ATR × this = TP distance (atr mode)
+  trailing_stop_pct                trailing stop from peak price (0 = disabled)
+  leverage_base / leverage_max     scale with confirmation score 1→4
+  position_size_base / position_size_max  scale with confirmation score 1→4
+  position_size_atr_dampen         reduce size when ATR is elevated
+  reentry_cooldown_minutes         wait after a closed trade before re-entering
+
+Confirmation scoring:
+  Score 1 — RSI alone fired (gatekeeper, always required)
+  Score 2 — + MACD histogram aligned
+  Score 3 — + Bollinger %B aligned
+  Score 4 — + Order-book imbalance aligned
+  Position size and leverage scale linearly from *_base (score 1) → *_max (score 4).
 """
 import asyncio
 import json
 import logging
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,14 +50,14 @@ from hermes_trading.adapters.macro import fetch as fetch_macro
 from hermes_trading.adapters.news import fetch as fetch_news
 from hermes_trading.adapters.onchain import fetch as fetch_onchain
 from hermes_trading.adapters.price import fetch as fetch_price
-from hermes_trading.score import score
+from hermes_trading.monte_carlo import run_model as run_mc_model
 
 log = logging.getLogger("hermes.loop")
 
-TICK_SECONDS = 60
+TICK_SECONDS = 10
 MAX_ADAPTER_RETRIES = 3
 CIRCUIT_BREAK_THRESHOLD = 5
-VOLUME_LOOKBACK = 20   # bars for average volume calculation
+VOLUME_LOOKBACK = 20   # bars for average volume
 
 
 class SchemaError(Exception):
@@ -58,9 +75,11 @@ class TradingLoop:
         self.heartbeat_file = state_dir / "heartbeat.json"
         self._consecutive_failures = 0
         self._open_trade: dict | None = None
-        self._peak_price: float = 0.0          # for trailing stop
-        self._last_close_time: float = 0.0     # for reentry cooldown
-        self._volume_history: list[float] = [] # for volume surge filter
+        self._peak_price: float = 0.0
+        self._last_close_time: float = 0.0
+        self._volume_history: list[float] = []
+        self._last_reflected_at: int = 0
+        self._tick_count: int = 0
 
     # ------------------------------------------------------------------ #
     #  Main loop                                                           #
@@ -98,14 +117,18 @@ class TradingLoop:
         data = await self._fetch_all()
         strategy = self._load_strategy()
 
-        price_data = data.get("price", {})
-        current_price = price_data.get("close", 0.0)
-        rsi = price_data.get("rsi", 50.0)
+        price_data     = data.get("price", {})
+        current_price  = price_data.get("close", 0.0)
+        rsi            = price_data.get("rsi", 50.0)
         current_volume = price_data.get("volume", 0.0)
+        macd_hist      = price_data.get("macd_hist", 0.0)
+        bb_pct         = price_data.get("bb_pct", 0.5)
+        atr            = price_data.get("atr", 0.0)
+        ob_imbalance   = price_data.get("ob_imbalance", 0.0)
 
         if current_price == 0.0:
             log.warning("Price is 0 — skipping tick (adapter failure)")
-            self._write_heartbeat(now, current_price, rsi, strategy.get("version", "?"))
+            self._write_heartbeat(now, price_data, strategy.get("version", "?"))
             return
 
         # Update volume history for surge filter
@@ -114,66 +137,147 @@ class TradingLoop:
             if len(self._volume_history) > VOLUME_LOOKBACK:
                 self._volume_history.pop(0)
 
-        # Read strategy variables with safe defaults
-        stop_loss_pct       = float(strategy.get("stop_loss_pct", 2.0))
-        take_profit_pct     = float(strategy.get("take_profit_pct", 0.0))     # 0 = disabled
-        trailing_stop_pct   = float(strategy.get("trailing_stop_pct", 0.0))   # 0 = disabled
-        leverage            = float(strategy.get("leverage", 1.0))
-        cooldown_minutes    = float(strategy.get("reentry_cooldown_minutes", 0.0))
-        entry_cfg           = strategy.get("entry", {})
-        rsi_exit_threshold  = float(entry_cfg.get("rsi_exit_threshold", 0.0)) # 0 = disabled
-        vol_surge_mult      = float(entry_cfg.get("volume_surge_multiplier", 0.0)) # 0 = disabled
+        # ── Strategy config ────────────────────────────────────────────────────
+        stop_loss_pct     = float(strategy.get("stop_loss_pct", 0.5))
+        trailing_stop_pct = float(strategy.get("trailing_stop_pct", 0.0))
+        cooldown_minutes  = float(strategy.get("reentry_cooldown_minutes", 1.0))
+        entry_cfg         = strategy.get("entry", {})
+
+        # Entry thresholds
+        direction_mode   = entry_cfg.get("direction", "both")   # long / short / both
+        long_threshold   = float(entry_cfg.get("long_threshold",  55))
+        short_threshold  = float(entry_cfg.get("short_threshold", 70))
+        long_rsi_exit    = float(entry_cfg.get("long_rsi_exit",   78))
+        short_rsi_exit   = float(entry_cfg.get("short_rsi_exit",  25))
+        vol_surge_mult   = float(entry_cfg.get("volume_surge_multiplier", 0.0))
+
+        # Dynamic leverage range
+        lev_base  = float(strategy.get("leverage_base",  1.5))
+        lev_max   = float(strategy.get("leverage_max",   3.0))
+
+        # Dynamic position size range
+        ps_base   = float(strategy.get("position_size_base",  0.15))
+        ps_max    = float(strategy.get("position_size_max",   0.40))
+        ps_dampen = bool(strategy.get("position_size_atr_dampen", True))
+
+        # Dynamic take profit
+        tp_mode     = strategy.get("take_profit_mode", "fixed")
+        tp_fixed    = float(strategy.get("take_profit_pct", 1.0))
+        tp_atr_mult = float(strategy.get("take_profit_atr_multiplier", 2.5))
+        tp_atr_min  = float(strategy.get("take_profit_atr_min_pct", 0.5))
+        tp_atr_max  = float(strategy.get("take_profit_atr_max_pct", 3.0))
+        if tp_mode == "atr" and atr > 0 and current_price > 0:
+            take_profit_pct = (atr * tp_atr_mult / current_price) * 100
+            take_profit_pct = round(max(tp_atr_min, min(tp_atr_max, take_profit_pct)), 3)
+        else:
+            take_profit_pct = tp_fixed
 
         trade_event = None
 
         if self._open_trade is None:
-            # ---- ENTRY logic ----
+            # ── ENTRY logic ───────────────────────────────────────────────────
+
             in_cooldown = (
                 cooldown_minutes > 0
                 and self._last_close_time > 0
                 and (time.time() - self._last_close_time) < cooldown_minutes * 60
             )
 
+            # Volume filter — shared for both directions
             volume_ok = True
             if vol_surge_mult > 0 and len(self._volume_history) >= 5:
-                avg_vol = sum(self._volume_history[:-1]) / len(self._volume_history[:-1])
+                avg_vol   = sum(self._volume_history[:-1]) / max(1, len(self._volume_history) - 1)
                 volume_ok = current_volume >= avg_vol * vol_surge_mult
 
-            if not in_cooldown and volume_ok and self._entry_fires(strategy, rsi):
+            entry_direction = None
+            entry_score = 0
+
+            if not in_cooldown and volume_ok:
+                # ── Long signal check ─────────────────────────────────────────
+                if direction_mode in ("long", "both") and rsi < long_threshold:
+                    entry_direction = "long"
+                    entry_score = 1   # RSI fired (gatekeeper)
+                    if entry_cfg.get("macd_confirm", False) and macd_hist > 0:
+                        entry_score += 1
+                    if entry_cfg.get("bb_confirm", False) and bb_pct < 0.35:
+                        entry_score += 1
+                    if entry_cfg.get("ob_confirm", False) and ob_imbalance > 0:
+                        entry_score += 1
+
+                # ── Short signal check ─────────────────────────────────────────
+                elif direction_mode in ("short", "both") and rsi > short_threshold:
+                    entry_direction = "short"
+                    entry_score = 1   # RSI fired (gatekeeper)
+                    if entry_cfg.get("macd_confirm", False) and macd_hist < 0:
+                        entry_score += 1
+                    if entry_cfg.get("bb_confirm", False) and bb_pct > 0.65:
+                        entry_score += 1
+                    if entry_cfg.get("ob_confirm", False) and ob_imbalance < 0:
+                        entry_score += 1
+
+            if entry_direction is not None:
+                # ── Scale leverage + position with score (1→base, 4→max) ──────
+                score_frac = (entry_score - 1) / 3.0   # 0.0 at score=1, 1.0 at score=4
+                leverage   = round(lev_base + (lev_max - lev_base) * score_frac, 2)
+                pos_size_r = ps_base + (ps_max - ps_base) * score_frac
+
+                # ATR dampening: if ATR > 0.5% of price, scale down
+                if ps_dampen and atr > 0 and current_price > 0:
+                    atr_pct = (atr / current_price) * 100
+                    if atr_pct > 0.5:
+                        dampen = max(0.5, 1.0 - (atr_pct - 0.5) * 0.3)
+                        pos_size_r *= dampen
+                pos_size_r = round(max(ps_base, min(ps_max, pos_size_r)), 4)
+
                 self._open_trade = {
-                    "id":               f"T{int(time.time())}",
-                    "asset":            self.asset,
-                    "entry_price":      current_price,
-                    "entry_time":       now,
-                    "direction":        entry_cfg.get("direction", "long"),
-                    "stop_loss_pct":    stop_loss_pct,
-                    "take_profit_pct":  take_profit_pct,
+                    "id":                f"T{int(time.time())}",
+                    "asset":             self.asset,
+                    "entry_price":       current_price,
+                    "entry_time":        now,
+                    "direction":         entry_direction,
+                    "stop_loss_pct":     stop_loss_pct,
+                    "take_profit_pct":   take_profit_pct,
                     "trailing_stop_pct": trailing_stop_pct,
-                    "leverage":         leverage,
-                    "position_size_r":  float(strategy.get("position_size_r", 0.5)),
-                    "strategy_version": strategy.get("version", "?"),
-                    "mode":             self.mode,
+                    "leverage":          leverage,
+                    "position_size_r":   pos_size_r,
+                    "strategy_version":  strategy.get("version", "?"),
+                    "mode":              self.mode,
+                    # Snapshot at entry for later analysis
+                    "entry_score":       entry_score,
+                    "entry_rsi":         rsi,
+                    "entry_macd_hist":   macd_hist,
+                    "entry_bb_pct":      bb_pct,
+                    "entry_atr":         atr,
+                    "entry_ob_imb":      ob_imbalance,
+                    "entry_tp_mode":     tp_mode,
                 }
                 self._peak_price = current_price
                 log.info(
-                    "ENTRY | price=%.2f rsi=%.1f leverage=%.1fx vol_ok=%s trade_id=%s",
-                    current_price, rsi, leverage, volume_ok, self._open_trade["id"],
+                    "ENTRY | dir=%s score=%d/4 price=%.2f rsi=%.1f lev=%.2fx pos=%.1f%% "
+                    "tp=%.3f%% macd_hist=%.4f bb_pct=%.3f ob_imb=%.3f trade_id=%s",
+                    entry_direction, entry_score, current_price, rsi,
+                    leverage, pos_size_r * 100, take_profit_pct,
+                    macd_hist, bb_pct, ob_imbalance, self._open_trade["id"],
                 )
 
         else:
-            # ---- EXIT logic ----
+            # ── EXIT logic ────────────────────────────────────────────────────
+            # Always read exit params from CURRENT strategy so changes take
+            # effect immediately without needing to close the trade first.
             entry_price = self._open_trade["entry_price"]
             direction   = self._open_trade["direction"]
             lev         = self._open_trade.get("leverage", 1.0)
-            tp_pct      = self._open_trade.get("take_profit_pct", 0.0)
-            ts_pct      = self._open_trade.get("trailing_stop_pct", 0.0)
-            sl_pct      = self._open_trade["stop_loss_pct"]
+            tp_pct      = float(strategy.get("take_profit_pct",   0.0))
+            ts_pct      = float(strategy.get("trailing_stop_pct", 0.0))
+            sl_pct      = float(strategy.get("stop_loss_pct",     0.5))
 
             # Update trailing peak
-            if direction == "long" and current_price > self._peak_price:
-                self._peak_price = current_price
-            elif direction == "short" and (self._peak_price == 0 or current_price < self._peak_price):
-                self._peak_price = current_price
+            if direction == "long":
+                if current_price > self._peak_price:
+                    self._peak_price = current_price
+            else:  # short — peak is the lowest price seen
+                if self._peak_price == 0.0 or current_price < self._peak_price:
+                    self._peak_price = current_price
 
             # Raw PnL (before leverage)
             if direction == "long":
@@ -181,7 +285,6 @@ class TradingLoop:
             else:
                 raw_pnl = (entry_price - current_price) / entry_price
 
-            # Exit conditions
             exit_reason = None
 
             # 1. Hard stop-loss
@@ -189,11 +292,11 @@ class TradingLoop:
                 exit_reason = "stop_loss"
 
             # 2. Take-profit
-            elif tp_pct > 0 and raw_pnl >= tp_pct / 100.0:
+            if not exit_reason and tp_pct > 0 and raw_pnl >= tp_pct / 100.0:
                 exit_reason = "take_profit"
 
             # 3. Trailing stop (from peak)
-            elif ts_pct > 0 and self._peak_price > 0:
+            if not exit_reason and ts_pct > 0 and self._peak_price > 0:
                 if direction == "long":
                     drop_from_peak = (self._peak_price - current_price) / self._peak_price
                     if drop_from_peak >= ts_pct / 100.0:
@@ -203,34 +306,36 @@ class TradingLoop:
                     if rise_from_peak >= ts_pct / 100.0:
                         exit_reason = "trailing_stop"
 
-            # 4. RSI overbought exit (for longs)
-            elif rsi_exit_threshold > 0 and direction == "long" and rsi >= rsi_exit_threshold:
-                exit_reason = "rsi_overbought"
+            # 4. RSI exit (direction-aware)
+            if not exit_reason:
+                if direction == "long" and rsi >= long_rsi_exit:
+                    exit_reason = "rsi_overbought"
+                elif direction == "short" and rsi <= short_rsi_exit:
+                    exit_reason = "rsi_oversold"
 
             # 5. 24-hour time exit
-            elif (time.time() - int(self._open_trade["id"][1:])) >= 86400:
-                exit_reason = "time_exit"
+            if not exit_reason:
+                trade_open_ts = int(self._open_trade["id"][1:])
+                if (time.time() - trade_open_ts) >= 86400:
+                    exit_reason = "time_exit"
 
             if exit_reason:
-                # Apply leverage to PnL
                 leveraged_pnl = raw_pnl * lev
 
                 trade_event = {
                     **self._open_trade,
-                    "exit_price":    current_price,
-                    "exit_time":     now,
-                    "exit_reason":   exit_reason,
-                    "pnl_pct":       round(raw_pnl, 6),
+                    "exit_price":      current_price,
+                    "exit_time":       now,
+                    "exit_reason":     exit_reason,
+                    "pnl_pct":         round(raw_pnl, 6),
                     "pnl_pct_levered": round(leveraged_pnl, 6),
-                    "peak_price":    self._peak_price,
-                    "closed":        True,
+                    "peak_price":      self._peak_price,
+                    "closed":          True,
                 }
                 log.info(
-                    "EXIT | reason=%s price=%.2f pnl=%.2f%% (%.2f%% levered) trade_id=%s",
-                    exit_reason,
-                    current_price,
-                    raw_pnl * 100,
-                    leveraged_pnl * 100,
+                    "EXIT | reason=%s dir=%s price=%.2f pnl=%.2f%% (%.2f%% levered) trade_id=%s",
+                    exit_reason, direction, current_price,
+                    raw_pnl * 100, leveraged_pnl * 100,
                     self._open_trade["id"],
                 )
                 self._last_close_time = time.time()
@@ -239,22 +344,19 @@ class TradingLoop:
 
         if trade_event:
             self._append_trade(trade_event)
+            await self._maybe_reflect()
+            asyncio.create_task(self._run_model())
 
-        self._write_heartbeat(now, current_price, rsi, strategy.get("version", "?"))
+        # Update model every 30 ticks (~5 min at 10s ticks)
+        self._tick_count += 1
+        if self._tick_count % 30 == 0:
+            asyncio.create_task(self._run_model())
+
+        self._write_heartbeat(now, price_data, strategy.get("version", "?"))
 
     # ------------------------------------------------------------------ #
     #  Helpers                                                             #
     # ------------------------------------------------------------------ #
-
-    def _entry_fires(self, strategy: dict, rsi: float) -> bool:
-        entry = strategy.get("entry", {})
-        indicator = entry.get("indicator", "rsi")
-        threshold = entry.get("threshold", 30)
-        direction = entry.get("direction", "long")
-
-        if indicator == "rsi":
-            return rsi < threshold if direction == "long" else rsi > (100 - threshold)
-        return False
 
     def _load_strategy(self) -> dict:
         with open(self.strategy_file) as f:
@@ -264,12 +366,80 @@ class TradingLoop:
         with open(self.trades_file, "a") as f:
             f.write(json.dumps(trade) + "\n")
 
-    def _write_heartbeat(self, ts: str, price: float, rsi: float, strategy_version: str) -> None:
+    async def _maybe_reflect(self) -> None:
+        """Trigger a reflection cycle if we've hit the cadence."""
+        cadence = int(self.goal.get("reflection_every", 10))
+        if cadence <= 0:
+            return
+
+        closed_count = 0
+        if self.trades_file.exists():
+            for line in self.trades_file.read_text().splitlines():
+                if line.strip():
+                    try:
+                        if json.loads(line).get("closed"):
+                            closed_count += 1
+                    except Exception:
+                        pass
+
+        if closed_count == 0 or closed_count % cadence != 0:
+            return
+        if closed_count == self._last_reflected_at:
+            return
+
+        self._last_reflected_at = closed_count
+        log.info(
+            "AUTO-REFLECT | trade #%d hit cadence of %d — spawning reflection",
+            closed_count, cadence,
+        )
+        asyncio.create_task(self._run_reflect())
+
+    async def _run_model(self) -> None:
+        """Run Monte Carlo model in background without blocking the loop."""
+        try:
+            loop = asyncio.get_event_loop()
+            starting = float(self.goal.get("starting_balance", 100_000))
+            await loop.run_in_executor(None, run_mc_model, starting)
+        except Exception as exc:
+            log.debug("Model run failed (non-fatal): %s", exc)
+
+    async def _run_reflect(self) -> None:
+        """Spawn reflect.py as a subprocess (tries --hermes, falls back to --fallback)."""
+        python = sys.executable
+        base   = Path(__file__).parent.parent
+
+        for mode in ("--hermes", "--fallback"):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    python, "-m", "hermes_trading.reflect", mode,
+                    cwd=str(base),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=180)
+                output = stdout.decode() if stdout else ""
+                if proc.returncode == 0:
+                    log.info("REFLECT DONE (%s):\n%s", mode, output.strip())
+                    return
+                log.warning("reflect %s exited %d — trying next mode", mode, proc.returncode)
+            except asyncio.TimeoutError:
+                log.error("reflect %s timed out after 180s", mode)
+            except Exception as exc:
+                log.error("reflect %s failed: %s", mode, exc)
+
+        log.error("All reflection modes failed — strategy unchanged this cycle")
+
+    def _write_heartbeat(self, ts: str, price_data: dict, strategy_version: str) -> None:
         hb = {
             "ts":                   ts,
             "asset":                self.asset,
-            "price":                price,
-            "rsi":                  rsi,
+            "price":                price_data.get("close", 0.0),
+            "rsi":                  price_data.get("rsi", 50.0),
+            "macd_hist":            price_data.get("macd_hist", 0.0),
+            "bb_pct":               price_data.get("bb_pct", 0.5),
+            "atr":                  price_data.get("atr", 0.0),
+            "momentum":             price_data.get("momentum", 0.0),
+            "ob_imbalance":         price_data.get("ob_imbalance", 0.0),
             "strategy_version":     strategy_version,
             "open_trade":           self._open_trade is not None,
             "peak_price":           self._peak_price,

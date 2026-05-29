@@ -1,13 +1,48 @@
-version: "03"
+version: "06"
+
 entry:
-  indicator: rsi
-  threshold: 32               # buy when RSI drops below this (oversold)
-  direction: long
-  volume_surge_multiplier: 1.5  # only enter when volume ≥ 1.5x 20-bar average
-  rsi_exit_threshold: 70      # exit long when RSI hits overbought
-stop_loss_pct: 2.0            # hard stop: cut loss at -2%
-take_profit_pct: 4.0          # lock gains at +4%
-trailing_stop_pct: 1.5        # trail 1.5% below peak (locks profit on big moves)
-leverage: 2.0                 # 2x position size — doubles gains AND losses
-reentry_cooldown_minutes: 15  # wait 15 min after closing before next entry
-position_size_r: 0.5
+  direction: both                  # long, short, or both
+
+  # Long entry (oversold bounce)
+  long_threshold: 55               # enter long when RSI < 55
+  long_rsi_exit: 78                # exit long when RSI > 78
+
+  # Short entry (overbought fade) — symmetric, same logic mirrored
+  short_threshold: 70              # enter short when RSI > 70
+  short_rsi_exit: 25               # exit short when RSI < 25
+
+  # Confirmations — each one adds +1 to score (0 → min size, 3 → max size)
+  # Long:  macd_hist > 0, bb_pct < 0.35, ob_imbalance > 0
+  # Short: macd_hist < 0, bb_pct > 0.65, ob_imbalance < 0
+  macd_confirm: true
+  bb_confirm: true
+  ob_confirm: true
+
+  volume_surge_multiplier: 1.2     # current vol must be >= 1.2x 20-bar avg
+
+# ── Stop / take-profit ────────────────────────────────────────────────────────
+stop_loss_pct: 0.5
+
+take_profit_mode: fixed            # 'fixed' or 'atr'
+take_profit_pct: 1.0
+take_profit_atr_multiplier: 2.5
+take_profit_atr_min_pct: 0.5
+take_profit_atr_max_pct: 3.0
+
+trailing_stop_pct: 0
+
+# ── Dynamic leverage (scales with confirmation score) ─────────────────────────
+# Score 1/4 (RSI only)  → leverage_base
+# Score 4/4 (all align) → leverage_max
+leverage_base: 1.5
+leverage_max: 3.0                  # capped at 3x until win rate > 60%
+
+# ── Dynamic position sizing (scales with confirmation score) ──────────────────
+# Score 1/4 → position_size_base (15%)
+# Score 4/4 → position_size_max  (40%)
+position_size_base: 0.15
+position_size_max: 0.40            # capped at 40% until win rate > 60%
+position_size_atr_dampen: true     # reduce size when ATR is elevated
+
+# ── Timing ────────────────────────────────────────────────────────────────────
+reentry_cooldown_minutes: 1

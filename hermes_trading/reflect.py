@@ -84,52 +84,211 @@ def append_hypothesis(hypothesis: dict) -> None:
 
 def reflect_fallback(strategy: dict, goal: dict, trades: list[dict]) -> tuple[dict, dict]:
     """
-    Simple deterministic rule:
-      - If realised return < target → loosen entry.threshold by 2 (more trades).
-      - If max_drawdown exceeded → tighten stop_loss_pct by 0.2 (less risk).
-    Always changes exactly ONE variable.
-    """
-    pnls = [t["pnl_pct"] for t in trades]
-    total_return = sum(pnls) if pnls else 0.0
+    Deterministic reflection covering all strategy variables.
+    Checks conditions in priority order and changes exactly ONE variable.
 
-    # Calculate max drawdown
+    Priority order:
+      1.  Drawdown too high             → tighten stop_loss_pct
+      2.  Leverage too aggressive       → reduce leverage_base
+      3.  RSI exits before TP (longs)   → raise long_rsi_exit
+      4.  RSI exits before TP (shorts)  → lower short_rsi_exit
+      5.  TP never reached              → lower take_profit_pct
+      6.  Too many stop-loss hits       → widen stop_loss_pct
+      7.  Consecutive losses            → increase reentry_cooldown_minutes
+      8.  Low win rate (long)           → tighten long_threshold (require deeper oversold)
+      9.  Low win rate (short)          → tighten short_threshold (require more overbought)
+     10.  Too few trades                → loosen long_threshold
+     11.  Volume filter blocking        → lower volume_surge_multiplier
+     12.  On track, good returns        → increase position_size_max
+     13.  Default                       → nudge leverage_base up slightly
+    """
     from hermes_trading.score import _max_drawdown
-    max_dd = _max_drawdown(pnls) if pnls else 0.0
+
+    pnls     = [t.get("pnl_pct", 0)         for t in trades]
+    pnls_lev = [t.get("pnl_pct_levered", 0) for t in trades]
+    reasons  = [t.get("exit_reason", "")     for t in trades]
+
+    total_return = sum(pnls_lev) if pnls_lev else 0.0
+    max_dd       = _max_drawdown(pnls_lev)   if pnls_lev else 0.0
+    win_rate     = sum(1 for p in pnls if p > 0) / len(pnls) if pnls else 0.0
+    n            = len(trades)
+
+    stop_loss_exits = reasons.count("stop_loss")
+    rsi_ob_exits    = reasons.count("rsi_overbought")   # long direction
+    rsi_os_exits    = reasons.count("rsi_oversold")     # short direction
+    rsi_exits       = rsi_ob_exits + rsi_os_exits
+    tp_exits        = reasons.count("take_profit")
+    time_exits      = reasons.count("time_exit")
+
+    long_trades  = [t for t in trades if t.get("direction") == "long"]
+    short_trades = [t for t in trades if t.get("direction") == "short"]
+
+    # running streak of losses
+    loss_streak = 0
+    for t in reversed(trades):
+        if t.get("pnl_pct", 0) < 0:
+            loss_streak += 1
+        else:
+            break
+
+    ecfg = strategy.get("entry", {})
 
     changed_var = None
-    old_val = None
-    new_val = None
-    reason = ""
+    old_val     = None
+    new_val     = None
+    reason      = ""
 
-    if max_dd > goal["max_drawdown"]:
-        # Priority: tighten stop loss to protect capital
-        old_val = strategy["stop_loss_pct"]
-        new_val = round(max(0.5, old_val - 0.2), 2)
+    # ── 1. Drawdown too high ──────────────────────────────────────────────────
+    if max_dd > goal.get("max_drawdown", 0.08):
+        old_val = float(strategy.get("stop_loss_pct", 0.5))
+        new_val = round(max(0.2, old_val - 0.1), 2)
         strategy["stop_loss_pct"] = new_val
         changed_var = "stop_loss_pct"
         reason = (
-            f"Max drawdown {max_dd:.2%} exceeded limit {goal['max_drawdown']:.2%}. "
-            f"Tightening stop_loss_pct: {old_val} → {new_val}."
+            f"Max drawdown {max_dd:.2%} exceeded limit {goal.get('max_drawdown', 0.08):.2%}. "
+            f"Tightening stop_loss_pct {old_val} → {new_val} to protect capital."
         )
-    elif total_return < goal["target_return_30d"]:
-        # Secondary: loosen entry threshold to capture more trades
-        old_val = strategy["entry"]["threshold"]
-        new_val = min(50, old_val + 2)
-        strategy["entry"]["threshold"] = new_val
-        changed_var = "entry.threshold"
+
+    # ── 2. Leverage too aggressive (drawdown > 60% of limit) ─────────────────
+    elif max_dd > goal.get("max_drawdown", 0.08) * 0.6:
+        old_val = float(strategy.get("leverage_base", 1.5))
+        new_val = round(max(1.0, old_val - 0.25), 2)
+        strategy["leverage_base"] = new_val
+        changed_var = "leverage_base"
         reason = (
-            f"Realised return {total_return:.2%} below target {goal['target_return_30d']:.2%}. "
-            f"Loosening entry.threshold: {old_val} → {new_val} (more entries)."
+            f"Drawdown {max_dd:.2%} approaching limit. "
+            f"Reducing leverage_base {old_val} → {new_val} to dampen loss magnitude."
         )
+
+    # ── 3. Long RSI exit fires before take-profit ────────────────────────────
+    elif (n >= 3 and len(long_trades) >= 2
+          and rsi_ob_exits / max(1, len(long_trades)) > 0.6
+          and tp_exits / n < 0.2):
+        old_val = float(ecfg.get("long_rsi_exit", 78))
+        new_val = round(min(92, old_val + 3), 1)
+        ecfg["long_rsi_exit"] = new_val
+        strategy["entry"] = ecfg
+        changed_var = "entry.long_rsi_exit"
+        reason = (
+            f"{rsi_ob_exits}/{len(long_trades)} long trades exited via RSI before take_profit. "
+            f"Raising long_rsi_exit {old_val} → {new_val} to give longs more room."
+        )
+
+    # ── 4. Short RSI exit fires before take-profit ───────────────────────────
+    elif (n >= 3 and len(short_trades) >= 2
+          and rsi_os_exits / max(1, len(short_trades)) > 0.6
+          and tp_exits / n < 0.2):
+        old_val = float(ecfg.get("short_rsi_exit", 25))
+        new_val = round(max(8, old_val - 3), 1)
+        ecfg["short_rsi_exit"] = new_val
+        strategy["entry"] = ecfg
+        changed_var = "entry.short_rsi_exit"
+        reason = (
+            f"{rsi_os_exits}/{len(short_trades)} short trades exited via RSI before take_profit. "
+            f"Lowering short_rsi_exit {old_val} → {new_val} to give shorts more room."
+        )
+
+    # ── 5. Take-profit never reached — target too ambitious ──────────────────
+    elif n >= 5 and tp_exits == 0 and rsi_exits + time_exits > n * 0.7:
+        old_val = float(strategy.get("take_profit_pct", 1.0))
+        new_val = round(max(0.3, old_val - 0.15), 2)
+        strategy["take_profit_pct"] = new_val
+        changed_var = "take_profit_pct"
+        reason = (
+            f"Take-profit hit 0 times in {n} trades (target may be too high). "
+            f"Lowering take_profit_pct {old_val} → {new_val} for more achievable exits."
+        )
+
+    # ── 6. Stop-loss hit too often — entry into noisy moves ──────────────────
+    elif n >= 5 and stop_loss_exits / n > 0.5:
+        old_val = float(strategy.get("stop_loss_pct", 0.5))
+        new_val = round(min(2.0, old_val + 0.15), 2)
+        strategy["stop_loss_pct"] = new_val
+        changed_var = "stop_loss_pct"
+        reason = (
+            f"Stop-loss triggered {stop_loss_exits}/{n} times — too much noise at current level. "
+            f"Widening stop_loss_pct {old_val} → {new_val} to reduce premature cuts."
+        )
+
+    # ── 7. Loss streak — cool down re-entry ──────────────────────────────────
+    elif loss_streak >= 3:
+        old_val = float(strategy.get("reentry_cooldown_minutes", 1))
+        new_val = round(min(30, old_val + 2), 1)
+        strategy["reentry_cooldown_minutes"] = new_val
+        changed_var = "reentry_cooldown_minutes"
+        reason = (
+            f"{loss_streak} consecutive losses. "
+            f"Increasing reentry_cooldown_minutes {old_val} → {new_val} to avoid revenge trading."
+        )
+
+    # ── 8. Low win rate on longs — tighten long entry ────────────────────────
+    elif (n >= 5 and win_rate < 0.4 and len(long_trades) > len(short_trades)):
+        old_val = float(ecfg.get("long_threshold", 55))
+        new_val = round(max(30, old_val - 3), 1)
+        ecfg["long_threshold"] = new_val
+        strategy["entry"] = ecfg
+        changed_var = "entry.long_threshold"
+        reason = (
+            f"Win rate {win_rate:.0%} below 40%, dominated by longs. "
+            f"Tightening long_threshold {old_val} → {new_val} (require deeper oversold)."
+        )
+
+    # ── 9. Low win rate on shorts — tighten short entry ──────────────────────
+    elif (n >= 5 and win_rate < 0.4 and len(short_trades) >= len(long_trades)):
+        old_val = float(ecfg.get("short_threshold", 70))
+        new_val = round(min(85, old_val + 3), 1)
+        ecfg["short_threshold"] = new_val
+        strategy["entry"] = ecfg
+        changed_var = "entry.short_threshold"
+        reason = (
+            f"Win rate {win_rate:.0%} below 40%, dominated by shorts. "
+            f"Tightening short_threshold {old_val} → {new_val} (require more overbought)."
+        )
+
+    # ── 10. Too few trades — loosen long entry threshold ─────────────────────
+    elif n < 3 and total_return < goal.get("target_return_30d", 0.05):
+        old_val = float(ecfg.get("long_threshold", 55))
+        new_val = round(min(65, old_val + 3), 1)
+        ecfg["long_threshold"] = new_val
+        strategy["entry"] = ecfg
+        changed_var = "entry.long_threshold"
+        reason = (
+            f"Only {n} trades recorded — entry threshold may be too tight. "
+            f"Loosening long_threshold {old_val} → {new_val} to increase trade frequency."
+        )
+
+    # ── 11. Volume filter blocking entries ───────────────────────────────────
+    elif n < 3 and float(ecfg.get("volume_surge_multiplier", 0)) > 1.0:
+        old_val = float(ecfg.get("volume_surge_multiplier", 1.2))
+        new_val = round(max(1.0, old_val - 0.1), 2)
+        ecfg["volume_surge_multiplier"] = new_val
+        strategy["entry"] = ecfg
+        changed_var = "entry.volume_surge_multiplier"
+        reason = (
+            f"Low trade count — volume filter may be too strict. "
+            f"Lowering volume_surge_multiplier {old_val} → {new_val}."
+        )
+
+    # ── 12. On track — increase position size ceiling ────────────────────────
+    elif total_return >= goal.get("target_return_30d", 0.05) * 0.5 and win_rate >= 0.5:
+        old_val = float(strategy.get("position_size_max", 0.40))
+        new_val = round(min(0.60, old_val + 0.05), 2)
+        strategy["position_size_max"] = new_val
+        changed_var = "position_size_max"
+        reason = (
+            f"Strategy performing well (return={total_return:.2%}, win_rate={win_rate:.0%}). "
+            f"Incrementally raising position_size_max {old_val} → {new_val}."
+        )
+
+    # ── 13. Default — nudge leverage_base up slightly ────────────────────────
     else:
-        # On track — slightly tighten position sizing for risk management
-        old_val = strategy["position_size_r"]
-        new_val = round(min(1.0, old_val + 0.05), 2)
-        strategy["position_size_r"] = new_val
-        changed_var = "position_size_r"
+        old_val = float(strategy.get("leverage_base", 1.5))
+        new_val = round(min(float(strategy.get("leverage_max", 3.0)), old_val + 0.25), 2)
+        strategy["leverage_base"] = new_val
+        changed_var = "leverage_base"
         reason = (
-            f"Strategy on track (return={total_return:.2%}, dd={max_dd:.2%}). "
-            f"Incrementally increasing position_size_r: {old_val} → {new_val}."
+            f"No critical issues detected (return={total_return:.2%}, dd={max_dd:.2%}). "
+            f"Incrementally raising leverage_base {old_val} → {new_val} to boost returns."
         )
 
     hypothesis = {
