@@ -45,6 +45,11 @@ _ohlc_cache: dict = {"candles": [], "ts": 0.0, "pair": ""}
 _OHLC_TTL = 30   # seconds
 
 
+def get_cached_candles() -> list:
+    """Return the most recently cached OHLC candles (read-only)."""
+    return list(_ohlc_cache.get("candles", []))
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 async def fetch(asset: str) -> dict[str, Any]:

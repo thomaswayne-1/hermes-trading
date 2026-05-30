@@ -6,8 +6,10 @@ can read live state without SSH or file access.
 
 Endpoints:
   GET /health          → {"status": "ok"}               (no auth)
-  GET /state           → heartbeat + strategy + goal + model as one JSON blob
+  GET /state           → heartbeat + strategy + goal + model + weights as JSON
   GET /trades          → full trades.jsonl as JSON array
+  GET /attribution     → attribution.jsonl as JSON array (per-cycle IC snapshots)
+  GET /hypotheses      → hypotheses.jsonl as JSON array (every strategy change)
 
 Auth: set API_SECRET env var in Railway. All protected endpoints require:
   X-API-Key: <API_SECRET>
@@ -82,6 +84,7 @@ async def handle_state(request: web.Request) -> web.Response:
         "strategy":  _ryaml("strategy.yaml"),
         "goal":      _ryaml("goal.yaml"),
         "model":     _rj("model.json"),
+        "weights":   _rj("weights.json"),
     })
 
 
@@ -91,13 +94,27 @@ async def handle_trades(request: web.Request) -> web.Response:
     return web.json_response(_rjsonl("trades.jsonl"))
 
 
+async def handle_attribution(request: web.Request) -> web.Response:
+    if not _authed(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    return web.json_response(_rjsonl("attribution.jsonl"))
+
+
+async def handle_hypotheses(request: web.Request) -> web.Response:
+    if not _authed(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    return web.json_response(_rjsonl("hypotheses.jsonl"))
+
+
 # ── Server lifecycle ──────────────────────────────────────────────────────────
 
 async def start_server() -> None:
     app = web.Application()
-    app.router.add_get("/health", handle_health)
-    app.router.add_get("/state",  handle_state)
-    app.router.add_get("/trades", handle_trades)
+    app.router.add_get("/health",       handle_health)
+    app.router.add_get("/state",        handle_state)
+    app.router.add_get("/trades",       handle_trades)
+    app.router.add_get("/attribution",  handle_attribution)
+    app.router.add_get("/hypotheses",   handle_hypotheses)
 
     runner = web.AppRunner(app)
     await runner.setup()

@@ -1,0 +1,5 @@
+{
+  "trending":  {"mom": 0.55, "rev": 0.10, "mic": 0.20, "sen": 0.15},
+  "ranging":   {"mom": 0.10, "rev": 0.55, "mic": 0.20, "sen": 0.15},
+  "high_vol":  {"mom": 0.20, "rev": 0.25, "mic": 0.20, "sen": 0.35}
+}

@@ -1,29 +1,96 @@
-version: "08"
+version: "09"
 
+# ── Coefficient engine master switch ──────────────────────────────────────────
+# false → engine computes C/K each tick (visible in heartbeat) but legacy
+#         RSI-gatekeeper logic still drives entries and sizing.
+# true  → engine fully drives entries, sizing, and coefficient-aware exits.
+#         Legacy RSI logic is bypassed.
+coefficient_engine_enabled: false
+
+# Master kill switch — false runs the entire stack in paper mode (already the case).
+live_trading: false
+
+# ── Coefficient engine (Part 1) ───────────────────────────────────────────────
+coefficient:
+  zscore_window: 200
+  gain: 1.5
+  tau_enter: 0.12
+  tau_exit: 0.05
+
+# ── Sizing (Part 2) ───────────────────────────────────────────────────────────
+sizing:
+  lambda_kelly: 0.35
+  size_floor: 0.05
+  size_cap: 0.40
+  kelly_budget_max: 0.60
+  reentry_cooldown_min: 2
+
+# ── Leverage (Part 2) ─────────────────────────────────────────────────────────
+leverage:
+  min: 1.0
+  max: 3.0
+
+# ── Exits (Part 2) — vol-scaled stop, R-multiple TP ───────────────────────────
+exits:
+  k_sl: 1.0
+  r_multiple: 1.5
+  stop_pct_bounds: [0.003, 0.015]
+  trade_horizon_bars: 30   # bars used to scale per-bar vol to trade horizon
+
+# ── Volatility (Part 4) ───────────────────────────────────────────────────────
+volatility:
+  ewma_lambda: 0.94
+  use_egarch: false
+
+# ── Regime (Part 3) — Markov primary (TODO), Hurst+ADX active ────────────────
+regime:
+  model: rules            # 'rules' = Hurst+ADX; 'markov' (TODO) when statsmodels added
+  k_regimes: 3
+  window: 500
+  weights:
+    trending:  {mom: 0.55, rev: 0.10, mic: 0.20, sen: 0.15}
+    ranging:   {mom: 0.10, rev: 0.55, mic: 0.20, sen: 0.15}
+    high_vol:  {mom: 0.20, rev: 0.25, mic: 0.20, sen: 0.35}
+
+# ── Self-improvement cadences (Part 5) ────────────────────────────────────────
+improvement:
+  fast_cadence_trades: 10
+  regime_cadence_trades: 50
+  hermes_cadence_trades: 50
+  ic_window: 40
+  ic_min_trades: 20
+  rho: 0.25
+  weight_step: 0.10
+
+# ── Guardrails (Part 6) ───────────────────────────────────────────────────────
+guardrails:
+  dd_soft: 0.06
+  dd_hard: 0.08
+  shadow_window: 100
+  kelly_bucket_min_samples: 50
+
+# ── Cost model (Part 2) ───────────────────────────────────────────────────────
+costs:
+  taker_fee_bps: 5.0
+  funding_period_hours: 8.0
+
+# ── LEGACY entry / exit (still active when coefficient_engine_enabled = false) ┐
+#  These match the v08 schema so the bot can revert at any time by flipping     │
+#  the master switch off.                                                       │
 entry:
-  direction: both                  # long, short, or both
-
-  # Long entry (oversold bounce)
-  long_threshold: 55               # enter long when RSI < 55
-  long_rsi_exit: 78                # exit long when RSI > 78
-
-  # Short entry (overbought fade) — symmetric, same logic mirrored
-  short_threshold: 65              # enter short when RSI > 65
-  short_rsi_exit: 25               # exit short when RSI < 25
-
-  # Confirmations — each one adds +1 to score (0 → min size, 3 → max size)
-  # Long:  macd_hist > 0, bb_pct < 0.35, ob_imbalance > 0
-  # Short: macd_hist < 0, bb_pct > 0.65, ob_imbalance < 0
+  direction: both
+  long_threshold: 55
+  long_rsi_exit: 78
+  short_threshold: 65
+  short_rsi_exit: 25
   macd_confirm: true
   bb_confirm: true
   ob_confirm: true
+  volume_surge_multiplier: 1.2
 
-  volume_surge_multiplier: 1.2     # current vol must be >= 1.2x 20-bar avg
-
-# ── Stop / take-profit ────────────────────────────────────────────────────────
 stop_loss_pct: 0.5
 
-take_profit_mode: fixed            # 'fixed' or 'atr'
+take_profit_mode: fixed
 take_profit_pct: 0.5
 take_profit_atr_multiplier: 2.5
 take_profit_atr_min_pct: 0.5
@@ -31,27 +98,17 @@ take_profit_atr_max_pct: 3.0
 
 trailing_stop_pct: 0
 
-# ── Profit-lock trailing stop ─────────────────────────────────────────────────
-# Once peak profit reaches activate%, a trailing stop kicks in.
-# If price then pulls back trail% from that peak, exit and lock the profit.
-profit_lock_activate_pct: 0.25    # activate when trade is up 0.25%
-profit_lock_trail_pct: 0.15       # trail from peak by 0.15%
+profit_lock_activate_pct: 0.25
+profit_lock_trail_pct: 0.15
 
-# ── Multiple concurrent positions ─────────────────────────────────────────────
-max_open_positions: 3             # max trades open at the same time
+max_open_positions: 3
 
-# ── Dynamic leverage (scales with confirmation score) ─────────────────────────
-# Score 1/4 (RSI only)  → leverage_base
-# Score 4/4 (all align) → leverage_max
 leverage_base: 1.5
-leverage_max: 3.0                  # capped at 3x until win rate > 60%
+leverage_max: 3.0
 
-# ── Dynamic position sizing (scales with confirmation score) ──────────────────
-# Score 1/4 → position_size_base (15%)
-# Score 4/4 → position_size_max  (40%)
 position_size_base: 0.15
-position_size_max: 0.40            # capped at 40% until win rate > 60%
-position_size_atr_dampen: true     # reduce size when ATR is elevated
+position_size_max: 0.40
+position_size_atr_dampen: true
 
-# ── Timing ────────────────────────────────────────────────────────────────────
 reentry_cooldown_minutes: 1
+# ── end legacy block ─────────────────────────────────────────────────────────┘
