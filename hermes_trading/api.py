@@ -24,7 +24,8 @@ from aiohttp import web
 
 log = logging.getLogger("hermes.api")
 
-STATE_DIR = Path(__file__).parent.parent / "state"
+_state_env = os.getenv("STATE_DIR", "")
+STATE_DIR = Path(_state_env) if _state_env else Path(__file__).parent.parent / "state"
 API_SECRET = os.getenv("API_SECRET", "")
 PORT = int(os.getenv("PORT", "8080"))   # Railway injects PORT automatically
 

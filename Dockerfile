@@ -11,9 +11,14 @@ ENV PATH="/root/.local/bin:${PATH}"
 COPY pyproject.toml ./
 COPY hermes_trading ./hermes_trading
 COPY state ./state
+COPY entrypoint.sh ./entrypoint.sh
 
-RUN uv sync
+RUN uv sync && chmod +x entrypoint.sh
 
 ENV HERMES_TRADING_MODE=paper
 
-CMD ["uv", "run", "python", "-m", "hermes_trading.run"]
+# Runtime state lives in /app/data (mount a Railway persistent volume here).
+# entrypoint.sh seeds it on first run and updates config on every redeploy.
+ENV STATE_DIR=/app/data
+
+CMD ["./entrypoint.sh"]

@@ -14,6 +14,7 @@ Both modes:
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -25,7 +26,8 @@ from hermes_trading.score import score
 
 log = logging.getLogger("hermes.reflect")
 
-STATE_DIR = Path(__file__).parent.parent / "state"
+_state_env = os.getenv("STATE_DIR", "")
+STATE_DIR = Path(_state_env) if _state_env else Path(__file__).parent.parent / "state"
 STRATEGY_FILE = STATE_DIR / "strategy.yaml"
 TRADES_FILE = STATE_DIR / "trades.jsonl"
 GOAL_FILE = STATE_DIR / "goal.yaml"

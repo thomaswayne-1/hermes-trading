@@ -27,7 +27,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("hermes.run")
 
-STATE_DIR = Path(__file__).parent.parent / "state"
+# Use STATE_DIR env var when set (Railway persistent volume at /app/data),
+# otherwise fall back to the bundled state/ directory (local dev).
+_state_env = os.getenv("STATE_DIR", "")
+STATE_DIR = Path(_state_env) if _state_env else Path(__file__).parent.parent / "state"
 GOAL_FILE = STATE_DIR / "goal.yaml"
 
 
