@@ -28,6 +28,7 @@ cp "$STATE/goal.yaml"     "$DATA/goal.yaml"
 [ -f "$DATA/heartbeat.json"    ] || echo '{}' > "$DATA/heartbeat.json"
 [ -f "$DATA/hypotheses.jsonl"  ] || touch "$DATA/hypotheses.jsonl"
 [ -f "$DATA/attribution.jsonl" ] || touch "$DATA/attribution.jsonl"
+[ -f "$DATA/open_trades.json"  ] || echo '{}' > "$DATA/open_trades.json"
 
 echo "[entrypoint] Data dir ready. Trades: $(wc -l < "$DATA/trades.jsonl") lines"
 

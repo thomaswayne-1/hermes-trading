@@ -66,19 +66,23 @@ class TradingLoop:
         self.mode = mode
         self.state_dir = state_dir
         self.goal = goal
-        self.strategy_file  = state_dir / "strategy.yaml"
-        self.weights_file   = state_dir / "weights.json"
-        self.trades_file    = state_dir / "trades.jsonl"
-        self.heartbeat_file = state_dir / "heartbeat.json"
+        self.strategy_file     = state_dir / "strategy.yaml"
+        self.weights_file      = state_dir / "weights.json"
+        self.trades_file       = state_dir / "trades.jsonl"
+        self.heartbeat_file    = state_dir / "heartbeat.json"
+        self.open_trades_file  = state_dir / "open_trades.json"
 
         self._consecutive_failures = 0
 
-        # Multiple concurrent positions
+        # Multiple concurrent positions — restored from disk on startup
         self._open_trades: list[dict] = []
         self._peak_prices: dict[str, float] = {}
         self._trough_prices: dict[str, float] = {}   # for MAE tracking
+        self._restore_open_trades()
 
-        self._last_entry_time: float = 0.0
+        self._last_entry_time: float = (
+            max((int(t["id"][1:]) for t in self._open_trades), default=0)
+        )
         self._volume_history: list[float] = []
         self._last_reflected_at: int = 0
         self._last_fast_cycle_at: int = 0
@@ -415,6 +419,7 @@ class TradingLoop:
             pass
         self._peak_prices.pop(trade_id, None)
         self._trough_prices.pop(trade_id, None)
+        self._save_open_trades()
 
         self._append_trade(closed)
         asyncio.create_task(self._post_close(strategy))
@@ -545,6 +550,7 @@ class TradingLoop:
         self._peak_prices[trade["id"]]   = current_price
         self._trough_prices[trade["id"]] = current_price
         self._last_entry_time = now_ts
+        self._save_open_trades()
 
         log.info(
             "ENGINE ENTRY | dir=%s C=%+0.3f K=%.3f regime=%s size=%.2f%% lev=%.2fx "
@@ -650,6 +656,7 @@ class TradingLoop:
         self._peak_prices[new_trade["id"]]   = current_price
         self._trough_prices[new_trade["id"]] = current_price
         self._last_entry_time = now_ts
+        self._save_open_trades()
         log.info(
             "LEGACY ENTRY | dir=%s score=%d/4 price=%.2f rsi=%.1f lev=%.2fx "
             "pos=%.1f%% open=%d id=%s",
@@ -756,6 +763,37 @@ class TradingLoop:
     def _append_trade(self, trade: dict) -> None:
         with open(self.trades_file, "a") as f:
             f.write(json.dumps(trade) + "\n")
+
+    def _save_open_trades(self) -> None:
+        """Persist open positions + peak/trough prices to disk so they survive restarts."""
+        snapshot = {
+            "open_trades":   self._open_trades,
+            "peak_prices":   self._peak_prices,
+            "trough_prices": self._trough_prices,
+        }
+        with open(self.open_trades_file, "w") as f:
+            json.dump(snapshot, f)
+
+    def _restore_open_trades(self) -> None:
+        """Reload open positions from disk on startup (survives Railway redeploys)."""
+        if not self.open_trades_file.exists():
+            return
+        try:
+            data = json.loads(self.open_trades_file.read_text())
+            self._open_trades   = data.get("open_trades", [])
+            self._peak_prices   = {k: float(v) for k, v in data.get("peak_prices", {}).items()}
+            self._trough_prices = {k: float(v) for k, v in data.get("trough_prices", {}).items()}
+            if self._open_trades:
+                log.info(
+                    "RESTORED %d open trade(s) from disk: %s",
+                    len(self._open_trades),
+                    [t["id"] for t in self._open_trades],
+                )
+        except Exception as exc:
+            log.warning("Could not restore open trades (starting fresh): %s", exc)
+            self._open_trades   = []
+            self._peak_prices   = {}
+            self._trough_prices = {}
 
     async def _maybe_reflect(self) -> None:
         """Legacy reflect cycle — only used when coefficient_engine_enabled = false."""
