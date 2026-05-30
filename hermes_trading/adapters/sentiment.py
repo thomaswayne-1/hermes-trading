@@ -20,7 +20,7 @@ FNG_URL = "https://api.alternative.me/fng/"
 SCHEMA_VERSION = "1"
 
 _cache: dict[str, Any] = {"value": 50.0, "classification": "neutral", "ts": 0.0}
-_TTL = 3600   # 1 hour
+_TTL = 300    # 5 minutes
 
 
 async def fetch(asset: str) -> dict[str, Any]:   # asset unused — FNG is BTC-wide
