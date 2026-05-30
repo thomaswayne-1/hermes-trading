@@ -1,4 +1,4 @@
-version: "07"
+version: "08"
 
 entry:
   direction: both                  # long, short, or both
@@ -30,6 +30,15 @@ take_profit_atr_min_pct: 0.5
 take_profit_atr_max_pct: 3.0
 
 trailing_stop_pct: 0
+
+# ── Profit-lock trailing stop ─────────────────────────────────────────────────
+# Once peak profit reaches activate%, a trailing stop kicks in.
+# If price then pulls back trail% from that peak, exit and lock the profit.
+profit_lock_activate_pct: 0.25    # activate when trade is up 0.25%
+profit_lock_trail_pct: 0.15       # trail from peak by 0.15%
+
+# ── Multiple concurrent positions ─────────────────────────────────────────────
+max_open_positions: 3             # max trades open at the same time
 
 # ── Dynamic leverage (scales with confirmation score) ─────────────────────────
 # Score 1/4 (RSI only)  → leverage_base
