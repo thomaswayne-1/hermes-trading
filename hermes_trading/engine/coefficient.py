@@ -55,6 +55,10 @@ class CoefficientEngine:
         candles: list[list[Any]] | None = None,
         funding_rate: float = 0.0,
         fng_value: float = 50.0,
+        ls_ratio: float = 1.0,
+        top_ls_ratio: float = 1.0,
+        taker_buy_ratio: float = 0.5,
+        oi_pct_change: float = 0.0,
     ) -> dict[str, Any]:
         """
         Process one tick. Returns a snapshot dict with C, K, regime,
@@ -73,7 +77,15 @@ class CoefficientEngine:
             self._last_price = live_price
 
         # Extract raw features
-        raw = extract_raw_features(price_data, candles, funding_rate, fng_value)
+        raw = extract_raw_features(
+            price_data, candles,
+            funding_rate=funding_rate,
+            fng_value=fng_value,
+            ls_ratio=ls_ratio,
+            top_ls_ratio=top_ls_ratio,
+            taker_buy_ratio=taker_buy_ratio,
+            oi_pct_change=oi_pct_change,
+        )
 
         # Append to buffer and z-score
         self.features.append(raw)

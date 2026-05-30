@@ -151,8 +151,12 @@ class TradingLoop:
         bb_pct         = float(price_data.get("bb_pct", 0.5))
         atr            = float(price_data.get("atr", 0.0))
         ob_imbalance   = float(price_data.get("ob_imbalance", 0.0))
-        funding_rate   = float(funding_data.get("funding_rate", 0.0))
-        fng_value      = float(sentiment_data.get("fng_value", 50.0))
+        funding_rate    = float(funding_data.get("funding_rate", 0.0))
+        fng_value       = float(sentiment_data.get("fng_value",       50.0))
+        ls_ratio        = float(sentiment_data.get("ls_ratio",         1.0))
+        top_ls_ratio    = float(sentiment_data.get("top_ls_ratio",     1.0))
+        taker_buy_ratio = float(sentiment_data.get("taker_buy_ratio",  0.5))
+        oi_pct_change   = float(sentiment_data.get("oi_pct_change",    0.0))
 
         if current_price == 0.0:
             log.warning("Price is 0 — skipping tick (adapter failure)")
@@ -166,8 +170,15 @@ class TradingLoop:
 
         # ── Tick the engine (always — for telemetry) ──────────────────────────
         candles = get_cached_candles()
-        snapshot = self.engine.tick(price_data, candles=candles,
-                                    funding_rate=funding_rate, fng_value=fng_value)
+        snapshot = self.engine.tick(
+            price_data, candles=candles,
+            funding_rate=funding_rate,
+            fng_value=fng_value,
+            ls_ratio=ls_ratio,
+            top_ls_ratio=top_ls_ratio,
+            taker_buy_ratio=taker_buy_ratio,
+            oi_pct_change=oi_pct_change,
+        )
         self._last_snapshot = snapshot
         C = float(snapshot["C"])
         K = float(snapshot["K"])

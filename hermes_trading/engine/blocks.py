@@ -16,8 +16,8 @@ import math
 BLOCK_FEATURES = {
     "mom": ["macd_hist", "roc_14", "ema20_slope", "signed_adx"],
     "rev": ["rsi_mr", "bb_mr", "vwap_dist"],
-    "mic": ["ob_imb", "vol_delta"],
-    "sen": ["funding_neg", "fng_contra"],
+    "mic": ["ob_imb", "vol_delta", "taker_buy", "oi_change"],
+    "sen": ["funding_neg", "fng_contra", "ls_contra", "top_ls_smart"],
 }
 
 

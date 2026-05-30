@@ -197,6 +197,10 @@ def extract_raw_features(
     candles: list[list[Any]] | None,
     funding_rate: float = 0.0,
     fng_value: float = 50.0,
+    ls_ratio: float = 1.0,
+    top_ls_ratio: float = 1.0,
+    taker_buy_ratio: float = 0.5,
+    oi_pct_change: float = 0.0,
 ) -> dict[str, float]:
     """
     Compute the raw (un-z-scored) feature dict.
@@ -242,9 +246,24 @@ def extract_raw_features(
     # Taker buy/sell delta not exposed by Kraken OHLC — leave 0
     vol_delta = 0.0
 
-    # Sentiment (contrarian)
-    funding_neg = -funding_rate
+    # Sentiment (contrarian + positioning)
+    funding_neg    = -funding_rate
     fng_contrarian = -(fng_value - 50.0) / 50.0
+
+    # Retail long/short: > 1 means crowd is net long → contrarian bearish
+    # Normalise: ratio of 1.5 (50% more longs than shorts) → signal of -0.5
+    ls_contra      = -(ls_ratio - 1.0)
+
+    # Top-trader (smart money): follow, not contrarian
+    # ratio > 1 = whales net long → bullish
+    top_ls_smart   = top_ls_ratio - 1.0
+
+    # Taker aggression: > 0.5 = more aggressive buyers → bullish microstructure
+    taker_buy      = taker_buy_ratio - 0.5
+
+    # Open interest change: positive = new money entering (conviction)
+    # keep as-is; z-score will scale it
+    oi_change      = oi_pct_change
 
     # Context (never directs C; feeds K and sizing)
     rv     = realized_vol(closes, 20)
@@ -264,9 +283,13 @@ def extract_raw_features(
         # microstructure
         "ob_imb":      ob_imb,
         "vol_delta":   vol_delta,
+        "taker_buy":   taker_buy,   # taker aggression: +ve = more aggressive buyers
+        "oi_change":   oi_change,   # OI % change: +ve = new money entering
         # sentiment (already contrarian-signed)
         "funding_neg": funding_neg,
         "fng_contra":  fng_contrarian,
+        "ls_contra":   ls_contra,   # retail crowd contrarian: +ve = crowd short = bullish
+        "top_ls_smart": top_ls_smart, # smart money: +ve = whales long = bullish
         # context (not in C, only in K / sizing)
         "realized_vol": rv,
         "atr_pct":      atr_p,
