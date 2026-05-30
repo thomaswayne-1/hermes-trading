@@ -61,6 +61,9 @@ improvement:
   ic_min_trades: 20
   rho: 0.25
   weight_step: 0.10
+  # Auto-engage: flip coefficient_engine_enabled to true after this many closed trades.
+  # Set to 0 to disable auto-engagement (manual flip only).
+  auto_engage_trades: 50
 
 # ── Guardrails (Part 6) ───────────────────────────────────────────────────────
 guardrails:

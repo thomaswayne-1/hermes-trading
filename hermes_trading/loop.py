@@ -97,6 +97,11 @@ class TradingLoop:
         # Hold the most recent engine snapshot for exit evaluation
         self._last_snapshot: dict = {"C": 0.0, "K": 0.0, "regime": "warmup", "ready": False}
 
+        # Auto-engage: True once we've flipped the engine on (or if it was already on)
+        self._engine_auto_engaged: bool = bool(
+            initial_strategy.get("coefficient_engine_enabled", False)
+        )
+
     # ------------------------------------------------------------------ #
     #  Main loop                                                           #
     # ------------------------------------------------------------------ #
@@ -422,6 +427,12 @@ class TradingLoop:
         closed = self._load_closed_trades()
         n = len(closed)
 
+        # ── Auto-engage: flip engine on when threshold reached ────────────────
+        if not engine_on:
+            self._maybe_auto_engage_engine(strategy, closed)
+            # Re-check in case we just flipped it
+            engine_on = bool(self._load_strategy().get("coefficient_engine_enabled", False))
+
         if engine_on and n > 0 and n % cadence == 0 and n != self._last_fast_cycle_at:
             self._last_fast_cycle_at = n
             try:
@@ -645,6 +656,71 @@ class TradingLoop:
             entry_direction, entry_score, current_price, rsi,
             leverage, pos_size_r * 100, len(self._open_trades), new_trade["id"],
         )
+
+    # ------------------------------------------------------------------ #
+    #  Helpers                                                             #
+    # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    #  Auto-engage                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _maybe_auto_engage_engine(self, strategy: dict, closed_trades: list[dict]) -> None:
+        """
+        Flip coefficient_engine_enabled → true once auto_engage_trades closed trades
+        have been recorded.  Fires exactly once per process lifetime (guarded by
+        _engine_auto_engaged).  Set improvement.auto_engage_trades = 0 to disable.
+        """
+        if self._engine_auto_engaged:
+            return
+        if bool(strategy.get("coefficient_engine_enabled", False)):
+            # Already on — someone flipped it manually or a prior run engaged it.
+            self._engine_auto_engaged = True
+            return
+
+        threshold = int(strategy.get("improvement", {}).get("auto_engage_trades", 50))
+        if threshold <= 0:
+            return   # disabled
+
+        n = len(closed_trades)
+        if n < threshold:
+            return
+
+        # ── Threshold crossed ─────────────────────────────────────────────────
+        self._engine_auto_engaged = True
+        log.info(
+            "AUTO-ENGAGE | %d closed trades reached threshold=%d — "
+            "flipping coefficient_engine_enabled = true",
+            n, threshold,
+        )
+
+        # Fresh read so we don't race with cycle.py writes
+        current = self._load_strategy()
+        current["coefficient_engine_enabled"] = True
+        with open(self.strategy_file, "w") as f:
+            yaml.dump(current, f, default_flow_style=False, sort_keys=False)
+
+        # Reload engine weights now that the engine is live
+        self.engine.regime_weights = self._load_weights(current)
+
+        # Record the event in hypotheses.jsonl
+        hyp = {
+            "ts":        datetime.now(timezone.utc).isoformat(),
+            "version":   current.get("version", "?"),
+            "layer":     "auto_engage",
+            "event":     "coefficient_engine_enabled → true",
+            "reason":    (
+                f"Auto-engagement: {n} closed trades reached threshold of {threshold}. "
+                "Coefficient engine now drives entries, sizing, and exits."
+            ),
+            "trades_at_engage": n,
+            "threshold":        threshold,
+        }
+        hyp_file = self.state_dir / "hypotheses.jsonl"
+        with open(hyp_file, "a") as f:
+            f.write(json.dumps(hyp) + "\n")
+
+        log.info("ENGINE ENGAGED — strategy.yaml updated, weights reloaded")
 
     # ------------------------------------------------------------------ #
     #  Helpers                                                             #
