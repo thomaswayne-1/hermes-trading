@@ -1,4 +1,4 @@
-version: "06"
+version: "07"
 
 entry:
   direction: both                  # long, short, or both
@@ -8,7 +8,7 @@ entry:
   long_rsi_exit: 78                # exit long when RSI > 78
 
   # Short entry (overbought fade) — symmetric, same logic mirrored
-  short_threshold: 70              # enter short when RSI > 70
+  short_threshold: 65              # enter short when RSI > 65
   short_rsi_exit: 25               # exit short when RSI < 25
 
   # Confirmations — each one adds +1 to score (0 → min size, 3 → max size)
@@ -24,7 +24,7 @@ entry:
 stop_loss_pct: 0.5
 
 take_profit_mode: fixed            # 'fixed' or 'atr'
-take_profit_pct: 1.0
+take_profit_pct: 0.5
 take_profit_atr_multiplier: 2.5
 take_profit_atr_min_pct: 0.5
 take_profit_atr_max_pct: 3.0
