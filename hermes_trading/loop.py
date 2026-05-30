@@ -306,11 +306,13 @@ class TradingLoop:
                     if rise_from_peak >= ts_pct / 100.0:
                         exit_reason = "trailing_stop"
 
-            # 4. RSI exit (direction-aware)
+            # 4. RSI exit (direction-aware, only fires when trade is profitable)
+            # Guard: raw_pnl > 0 prevents RSI from locking in a loss during a
+            # dead-cat bounce — RSI exit is a profit-taking tool, not a stop.
             if not exit_reason:
-                if direction == "long" and rsi >= long_rsi_exit:
+                if direction == "long" and rsi >= long_rsi_exit and raw_pnl > 0:
                     exit_reason = "rsi_overbought"
-                elif direction == "short" and rsi <= short_rsi_exit:
+                elif direction == "short" and rsi <= short_rsi_exit and raw_pnl > 0:
                     exit_reason = "rsi_oversold"
 
             # 5. 24-hour time exit
