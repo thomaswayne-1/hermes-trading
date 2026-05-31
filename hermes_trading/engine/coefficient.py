@@ -93,6 +93,20 @@ class CoefficientEngine:
             return self._cold_start_snapshot(raw)
 
         z = self.features.zscores(raw)
+
+        # Sentiment features are LEVEL indicators, not change indicators.
+        # Z-scoring makes them 0 whenever they're stable (which is most of
+        # the time — FNG updates once/day, L/S ratio moves slowly).
+        # Override with scaled raw values so the engine sees actual market
+        # state: FNG=28 (Fear) is always a bullish contrarian signal, not
+        # only on the day it drops.
+        z["fng_contra"]   = raw["fng_contra"]                           # already in [-1,+1]
+        z["ls_contra"]    = math.tanh(raw["ls_contra"]    * 2.0)       # -(ratio-1) → [-1,+1]
+        z["top_ls_smart"] = math.tanh(raw["top_ls_smart"] * 2.0)       # (ratio-1)  → [-1,+1]
+        z["funding_neg"]  = math.tanh(raw["funding_neg"]  * 5000.0)    # tiny bps → amplify
+        z["taker_buy"]    = math.tanh(raw["taker_buy"]    * 4.0)       # [-0.5,+0.5] → [-1,+1]
+        z["oi_change"]    = math.tanh(raw["oi_change"]    * 50.0)      # % change → bounded
+
         sub = compute_blocks(z)   # {mom, rev, mic, sen} each in [-1, +1]
 
         # Classify regime from cached candles
