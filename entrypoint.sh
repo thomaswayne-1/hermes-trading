@@ -30,6 +30,9 @@ cp "$STATE/goal.yaml"     "$DATA/goal.yaml"
 [ -f "$DATA/attribution.jsonl" ] || touch "$DATA/attribution.jsonl"
 [ -f "$DATA/open_trades.json"  ] || echo '{}' > "$DATA/open_trades.json"
 
-echo "[entrypoint] Data dir ready. Trades: $(wc -l < "$DATA/trades.jsonl") lines"
+TRADE_COUNT=$(wc -l < "$DATA/trades.jsonl" 2>/dev/null || echo 0)
+echo "[entrypoint] Data dir: $DATA"
+echo "[entrypoint] Volume check — trades.jsonl: $TRADE_COUNT lines, model.json exists: $([ -f "$DATA/model.json" ] && echo yes || echo no)"
+echo "[entrypoint] If trades=0 on every restart, the Railway volume is not mounted at $DATA"
 
 exec uv run python -m hermes_trading.run
