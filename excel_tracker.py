@@ -221,11 +221,15 @@ def run():
     trail      = round(peak * (1 - tsp / 100), 2) if open_tr and peak and tsp else ""
 
     # Realised balance from closed trade history
+    # Use pnl_pct_net (after taker fees + funding) — falls back to pnl_pct_levered
+    # for old trades recorded before net PnL was tracked.
     balance = starting_balance
     trade_dollar_pnls = []
     for t in closed:
         t_pos  = float(t.get("position_size_r", pos_size_r))
-        d      = dollar_pnl(t.get("pnl_pct_levered", 0), t_pos, balance)
+        pnl    = t.get("pnl_pct_net") if t.get("pnl_pct_net") is not None \
+                 else t.get("pnl_pct_levered", 0)
+        d      = dollar_pnl(pnl, t_pos, balance)
         trade_dollar_pnls.append(d)
         balance += d
 
@@ -455,7 +459,7 @@ def run():
                 f"${t.get('entry_price', 0):,.2f}",
                 f"${t.get('exit_price', 0):,.2f}",
                 usd(d),
-                pct(t.get("pnl_pct_levered", 0)),
+                pct(t.get("pnl_pct_net") if t.get("pnl_pct_net") is not None else t.get("pnl_pct_levered", 0)),
                 f"${running:,.2f}",
                 t.get("exit_reason", "").replace("_", " "),
                 "v" + str(t.get("strategy_version", "?")),
