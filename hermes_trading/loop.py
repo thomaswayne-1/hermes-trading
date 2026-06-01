@@ -72,6 +72,7 @@ class TradingLoop:
         self.trades_file       = state_dir / "trades.jsonl"
         self.heartbeat_file    = state_dir / "heartbeat.json"
         self.open_trades_file  = state_dir / "open_trades.json"
+        self.engine_state_file = state_dir / "engine_state.json"
 
         self._consecutive_failures = 0
 
@@ -102,6 +103,16 @@ class TradingLoop:
         coef_cfg = initial_strategy.get("coefficient", {})
         regime_weights = self._load_weights(initial_strategy)
         self.engine = CoefficientEngine(coef_cfg, regime_weights=regime_weights)
+
+        # Restore engine state from disk — skips the 33-minute warmup on redeploy
+        if self.engine.load_state(self.engine_state_file):
+            log.info(
+                "ENGINE RESTORED | %d samples loaded from disk — ready immediately",
+                len(self.engine.features),
+            )
+        else:
+            log.info("ENGINE COLD START | warming up (%d samples needed)",
+                     self.engine.zscore_window)
         guard_cfg = initial_strategy.get("guardrails", {})
         self.circuit = CircuitBreaker(
             dd_soft=float(guard_cfg.get("dd_soft", 0.06)),
@@ -246,6 +257,7 @@ class TradingLoop:
             asyncio.create_task(self._run_model())
 
         self._write_heartbeat(now_iso, price_data, strategy.get("version", "?"), snapshot)
+        self.engine.save_state(self.engine_state_file)
 
     # ------------------------------------------------------------------ #
     #  Exit evaluation                                                     #

@@ -13,7 +13,10 @@ Layer D: conviction scalar.
 """
 from __future__ import annotations
 
+import json
 import math
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .features import FeatureBuffer, extract_raw_features
@@ -48,6 +51,76 @@ class CoefficientEngine:
             "ranging":   {"mom": 0.10, "rev": 0.55, "mic": 0.20, "sen": 0.15},
             "high_vol":  {"mom": 0.20, "rev": 0.25, "mic": 0.20, "sen": 0.35},
         }
+
+    # ------------------------------------------------------------------ #
+    #  State persistence — survives Railway redeploys                     #
+    # ------------------------------------------------------------------ #
+
+    def save_state(self, path: Path) -> None:
+        """
+        Serialise the entire engine state to JSON.
+        Called after every tick so a redeploy restores instantly.
+        Errors are silently swallowed — a failed save is not fatal.
+        """
+        try:
+            state = {
+                "saved_at":    datetime.now(timezone.utc).isoformat(),
+                "last_price":  self._last_price,
+                # FeatureBuffer: list of raw feature dicts
+                "feature_buffer": list(self.features._buf),
+                # EWMA forecaster
+                "ewma": {
+                    "var":         self.vol._var,
+                    "initialized": self.vol._initialized,
+                    "return_buf":  list(self.vol._return_buf),
+                    "var_history": list(self.vol._var_history),
+                },
+                # Regime classifier vol history
+                "regime_vol_history": list(self.regime._vol_history),
+            }
+            path.write_text(json.dumps(state))
+        except Exception:
+            pass   # non-fatal
+
+    def load_state(self, path: Path) -> bool:
+        """
+        Restore engine state from JSON written by save_state().
+        Returns True if the buffer was successfully reloaded (engine is ready
+        immediately), False if not (normal cold start).
+        """
+        if not path.exists():
+            return False
+        try:
+            state = json.loads(path.read_text())
+
+            # FeatureBuffer
+            buf_data = state.get("feature_buffer", [])
+            for entry in buf_data:
+                self.features._buf.append({k: float(v) for k, v in entry.items()})
+
+            # EWMA
+            ewma = state.get("ewma", {})
+            self.vol._var         = float(ewma.get("var", 0.0))
+            self.vol._initialized = bool(ewma.get("initialized", False))
+            for r in ewma.get("return_buf", []):
+                self.vol._return_buf.append(float(r))
+            for v in ewma.get("var_history", []):
+                self.vol._var_history.append(float(v))
+
+            # Regime vol history
+            for v in state.get("regime_vol_history", []):
+                self.regime._vol_history.append(float(v))
+
+            # Last price
+            self.vol._var = float(state.get("ewma", {}).get("var", self.vol._var))
+            lp = state.get("last_price", 0.0)
+            if lp:
+                self._last_price = float(lp)
+
+            samples = len(self.features._buf)
+            return samples >= 30   # ready threshold
+        except Exception:
+            return False
 
     def tick(
         self,

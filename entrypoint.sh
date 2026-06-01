@@ -29,6 +29,7 @@ cp "$STATE/goal.yaml"     "$DATA/goal.yaml"
 [ -f "$DATA/hypotheses.jsonl"  ] || touch "$DATA/hypotheses.jsonl"
 [ -f "$DATA/attribution.jsonl" ] || touch "$DATA/attribution.jsonl"
 [ -f "$DATA/open_trades.json"  ] || echo '{}' > "$DATA/open_trades.json"
+# engine_state.json is written by the engine each tick — no need to seed it
 
 TRADE_COUNT=$(wc -l < "$DATA/trades.jsonl" 2>/dev/null || echo 0)
 echo "[entrypoint] Data dir: $DATA"
