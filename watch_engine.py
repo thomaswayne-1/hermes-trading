@@ -101,16 +101,22 @@ def render(state: dict, trades: list) -> None:
     open_trades = hb.get("open_trades", [])
 
     # ── Performance from closed trades ────────────────────────────────────────
+    # Uses identical logic to excel_tracker.py:
+    #   - cumulative balance (each trade's dollar compounds on the running balance)
+    #   - pnl_pct_net (after fees+funding); fallback to pnl_pct_levered for old trades
+    #   - win = pnl_pct_net > 0 (after fees, not raw)
     closed  = [t for t in trades if t.get("closed")]
     n       = len(closed)
-    wins    = sum(1 for t in closed
-                  if t.get("pnl_pct_net", t.get("pnl_pct_levered", 0)) > 0)
-    wr      = wins / n if n else 0.0
     balance = STARTING
+    wins    = 0
     for t in closed:
-        pnl  = t.get("pnl_pct_net", t.get("pnl_pct_levered", 0))
+        pnl  = t.get("pnl_pct_net") if t.get("pnl_pct_net") is not None \
+               else t.get("pnl_pct_levered", 0)
         size = float(t.get("position_size_r", 0.15))
-        balance += pnl * size * STARTING
+        balance += pnl * size * balance   # cumulative — same as tracker
+        if pnl > 0:
+            wins += 1
+    wr      = wins / n if n else 0.0
     net_pnl = balance - STARTING
 
     # ── Unrealised PnL on open positions ─────────────────────────────────────

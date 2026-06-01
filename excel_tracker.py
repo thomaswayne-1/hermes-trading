@@ -107,22 +107,59 @@ def rmodel():
         return {}
 
 
+# ── Last-known-good cache — never zero out on a brief outage ─────────────────
+_cache: dict = {
+    "hb": {}, "trades": [], "strategy": {}, "goal": {}, "model": {},
+    "stale": False, "stale_since": None,
+}
+
 def fetch_all():
-    """Return (heartbeat, trades, strategy, goal, model) regardless of mode."""
+    """
+    Return (heartbeat, trades, strategy, goal, model).
+    On any failure, or if Railway returns suspiciously fewer closed trades
+    than we last saw (redeploy blip), return the last good snapshot and
+    mark it stale so the terminal line shows [STALE].
+    """
+    global _cache
+
     if RAILWAY_URL:
         try:
             blob   = _http_get("/state")
             trades = _http_get("/trades")
-            return (
-                blob.get("heartbeat", {}),
-                [t for t in trades if t.get("closed")],
-                blob.get("strategy", {}),
-                blob.get("goal", {}),
-                blob.get("model", {}),
-            )
+            closed = [t for t in trades if t.get("closed")]
+
+            # Sanity check: never trust a response that has fewer closed trades
+            # than our cache — that means the bot just restarted and hasn't
+            # re-read the volume yet (or the volume is temporarily unavailable).
+            if len(closed) < len(_cache["trades"]):
+                raise ValueError(
+                    f"Response has {len(closed)} closed trades "
+                    f"but cache has {len(_cache['trades'])} — likely a redeploy blip"
+                )
+
+            # Good response — update cache
+            _cache.update({
+                "hb": blob.get("heartbeat", {}),
+                "trades": closed,
+                "strategy": blob.get("strategy", {}),
+                "goal": blob.get("goal", {}),
+                "model": blob.get("model", {}),
+                "stale": False,
+                "stale_since": None,
+            })
+
         except Exception as e:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Railway fetch error: {e}")
-            return {}, [], {}, {}, {}
+            now = datetime.now().strftime("%H:%M:%S")
+            if not _cache["stale"]:
+                _cache["stale"] = True
+                _cache["stale_since"] = now
+            print(f"[{now}] [STALE — using last good data] {e}")
+
+        return (
+            _cache["hb"], _cache["trades"], _cache["strategy"],
+            _cache["goal"], _cache["model"],
+        )
+
     else:
         hb     = rj("heartbeat.json")
         trades = [t for t in rjsonl("trades.jsonl") if t.get("closed")]
@@ -241,7 +278,10 @@ def run():
     effective_balance = balance + unrealised
 
     # ── Terminal line ──────────────────────────────────────────────────────────
-    src  = "railway" if RAILWAY_URL else "local"
+    stale = _cache.get("stale", False)
+    src   = "railway" if RAILWAY_URL else "local"
+    if stale:
+        src = f"STALE since {_cache.get('stale_since','?')}"
     now  = datetime.now().strftime("%H:%M:%S")
 
     if open_details:
@@ -333,13 +373,16 @@ def run():
             ["Max drawdown",       ""],
         ]
     else:
-        wins    = [t for t in closed if t.get("pnl_pct", 0) > 0]
-        losses  = [t for t in closed if t.get("pnl_pct", 0) <= 0]
+        def _net(t):
+            v = t.get("pnl_pct_net")
+            return v if v is not None else t.get("pnl_pct_levered", 0)
+        wins    = [t for t in closed if _net(t) > 0]
+        losses  = [t for t in closed if _net(t) <= 0]
         longs   = [t for t in closed if t.get("direction") == "long"]
         shorts  = [t for t in closed if t.get("direction") == "short"]
         wr      = len(wins) / len(closed) * 100
-        best_i  = max(range(len(closed)), key=lambda i: closed[i].get("pnl_pct_levered", 0))
-        worst_i = min(range(len(closed)), key=lambda i: closed[i].get("pnl_pct_levered", 0))
+        best_i  = max(range(len(closed)), key=lambda i: _net(closed[i]))
+        worst_i = min(range(len(closed)), key=lambda i: _net(closed[i]))
 
         cum = 1.0; pk = 1.0; dd = 0.0
         for t in closed:
