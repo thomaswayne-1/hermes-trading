@@ -449,7 +449,7 @@ def write_csvs(state: dict, closed: list) -> None:
         for t in closed:
             sc = t.get("entry_score", "eng")
             score_counts[sc] = score_counts.get(sc, 0) + 1
-        score_str = "  ".join(f"{k}×{v}" for k, v in sorted(str(x) for x in score_counts.items()))
+        score_str = "  ".join(f"{k}×{v}" for k, v in sorted(score_counts.items(), key=lambda x: str(x[0])))
 
         stats = [
             ["Field",             "Value"],
