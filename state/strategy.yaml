@@ -22,7 +22,7 @@ sizing:
   lambda_kelly: 0.35
   size_floor: 0.05
   size_cap: 0.40
-  kelly_budget_max: 0.60
+  kelly_budget_max: 0.80
   reentry_cooldown_min: 2
 
 # ── Leverage (Part 2) ─────────────────────────────────────────────────────────
