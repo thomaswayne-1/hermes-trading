@@ -1,0 +1,201 @@
+"""
+backup.py — GitHub Gist backup for trade history.
+
+Stores the entire trades.jsonl as a private Gist so trade history
+survives Railway volume resets, redeploys, and any other data-loss event.
+
+Environment:
+    GITHUB_TOKEN — personal access token with `gist` scope.
+                   If unset, backup is silently skipped everywhere.
+
+Gist management:
+    - On first push  : creates a new private Gist; saves its ID to gist_id.txt.
+    - Subsequent push: PATCHes the existing Gist (overwrites file content).
+    - Startup restore: if trades.jsonl is empty, fetches from the Gist.
+    - Self-healing   : if gist_id.txt is missing (volume wiped), scans the
+                       authenticated user's Gists for one containing
+                       hermes_trades.jsonl and rebuilds gist_id.txt.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+
+import httpx
+
+log = logging.getLogger("hermes.backup")
+
+GIST_FILENAME = "hermes_trades.jsonl"
+GIST_DESC     = "Hermes Trading — trade history backup"
+GITHUB_API    = "https://api.github.com"
+TIMEOUT       = 20.0
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _token() -> str | None:
+    return os.environ.get("GITHUB_TOKEN")
+
+
+def _headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept":        "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _gist_id_path(trades_file: Path) -> Path:
+    return trades_file.parent / "gist_id.txt"
+
+
+def _find_existing_gist(token: str) -> str | None:
+    """
+    Scan the authenticated user's Gists (up to 300) for one containing
+    hermes_trades.jsonl.  Used when gist_id.txt is missing after a volume wipe.
+    """
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            for page in range(1, 4):
+                resp = client.get(
+                    f"{GITHUB_API}/gists",
+                    headers=_headers(token),
+                    params={"per_page": 100, "page": page},
+                )
+                resp.raise_for_status()
+                gists = resp.json()
+                if not gists:
+                    break
+                for g in gists:
+                    if GIST_FILENAME in g.get("files", {}):
+                        log.info("BACKUP | Found existing Gist %s via scan", g["id"])
+                        return g["id"]
+    except Exception as exc:
+        log.warning("BACKUP | Gist scan failed: %s", exc)
+    return None
+
+
+def _resolve_gist_id(trades_file: Path, token: str) -> str:
+    """
+    Return the known Gist ID from gist_id.txt, or search GitHub if the file
+    is missing (e.g. after a volume wipe).  Returns "" if none found.
+    """
+    id_path = _gist_id_path(trades_file)
+    if id_path.exists():
+        gist_id = id_path.read_text().strip()
+        if gist_id:
+            return gist_id
+
+    # gist_id.txt is gone — try to recover via API scan
+    gist_id = _find_existing_gist(token) or ""
+    if gist_id:
+        id_path.write_text(gist_id)   # rebuild the file
+    return gist_id
+
+
+# ── Synchronous restore (called at startup, before the async event loop) ──────
+
+def restore_from_gist(trades_file: Path) -> int:
+    """
+    If trades_file is empty AND GITHUB_TOKEN is set, fetch trade history from
+    the backup Gist and write it to trades_file.
+
+    Returns the number of trade lines restored (0 if nothing done).
+    """
+    token = _token()
+    if not token:
+        return 0
+
+    # Only restore into an empty file — never overwrite existing data.
+    if trades_file.exists() and trades_file.stat().st_size > 0:
+        existing_lines = len([l for l in trades_file.read_text().splitlines() if l.strip()])
+        log.debug("BACKUP | trades.jsonl has %d lines — skipping restore", existing_lines)
+        return 0
+
+    gist_id = _resolve_gist_id(trades_file, token)
+    if not gist_id:
+        log.info("BACKUP | No existing Gist found — starting fresh (first run or no history)")
+        return 0
+
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            resp = client.get(
+                f"{GITHUB_API}/gists/{gist_id}",
+                headers=_headers(token),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        file_obj = data.get("files", {}).get(GIST_FILENAME)
+        if not file_obj:
+            log.warning("BACKUP | Gist %s has no %s file", gist_id, GIST_FILENAME)
+            return 0
+
+        content = file_obj.get("content", "")
+        if not content.strip():
+            return 0
+
+        trades_file.parent.mkdir(parents=True, exist_ok=True)
+        trades_file.write_text(content)
+        n = len([l for l in content.splitlines() if l.strip()])
+        log.info("BACKUP | ✓ Restored %d trade(s) from Gist %s", n, gist_id)
+        return n
+
+    except Exception as exc:
+        log.warning("BACKUP | Restore failed (non-fatal): %s", exc)
+        return 0
+
+
+# ── Asynchronous push (called fire-and-forget after each trade close) ─────────
+
+async def push_to_gist(trades_file: Path) -> None:
+    """
+    Push the current trades.jsonl to GitHub Gist.
+    Creates a new private Gist on first call; PATCHes the existing one thereafter.
+    All errors are logged as warnings — this function never raises.
+    """
+    token = _token()
+    if not token:
+        return
+
+    if not trades_file.exists():
+        return
+
+    content = trades_file.read_text()
+    if not content.strip():
+        return
+
+    gist_id = _resolve_gist_id(trades_file, token)
+    n_lines = len([l for l in content.splitlines() if l.strip()])
+
+    payload: dict = {
+        "files": {GIST_FILENAME: {"content": content}}
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            if gist_id:
+                resp = await client.patch(
+                    f"{GITHUB_API}/gists/{gist_id}",
+                    headers=_headers(token),
+                    json=payload,
+                )
+                resp.raise_for_status()
+                log.info("BACKUP | ✓ Pushed %d trade(s) to Gist %s", n_lines, gist_id)
+            else:
+                payload["description"] = GIST_DESC
+                payload["public"]      = False
+                resp = await client.post(
+                    f"{GITHUB_API}/gists",
+                    headers=_headers(token),
+                    json=payload,
+                )
+                resp.raise_for_status()
+                new_id = resp.json().get("id", "")
+                if new_id:
+                    _gist_id_path(trades_file).write_text(new_id)
+                    log.info("BACKUP | ✓ Created Gist %s with %d trade(s)", new_id, n_lines)
+
+    except Exception as exc:
+        log.warning("BACKUP | Push failed (non-fatal): %s", exc)

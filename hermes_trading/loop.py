@@ -34,6 +34,7 @@ from hermes_trading.adapters.onchain import fetch as fetch_onchain
 from hermes_trading.adapters.price import fetch as fetch_price, get_cached_candles
 from hermes_trading.adapters.funding import fetch as fetch_funding
 from hermes_trading.adapters.sentiment import fetch as fetch_sentiment
+from hermes_trading.adapters import backup
 from hermes_trading.monte_carlo import run_model as run_mc_model
 
 from hermes_trading.engine.coefficient import CoefficientEngine
@@ -78,6 +79,14 @@ class TradingLoop:
         self._open_trades: list[dict] = []
         self._peak_prices: dict[str, float] = {}
         self._trough_prices: dict[str, float] = {}   # for MAE tracking
+
+        # GitHub Gist restore: if trades.jsonl is empty, pull from backup Gist.
+        # This runs synchronously before the event loop so it's safe to use
+        # httpx.Client here.  Errors are non-fatal (logged as warnings).
+        restored = backup.restore_from_gist(self.trades_file)
+        if restored:
+            log.info("STARTUP | Loaded %d trade(s) from GitHub Gist backup", restored)
+
         self._restore_open_trades()
 
         self._last_entry_time: float = (
@@ -433,6 +442,9 @@ class TradingLoop:
         self._save_open_trades()
 
         self._append_trade(closed)
+        # Fire-and-forget: push updated trade history to GitHub Gist.
+        # Non-blocking — a push failure never affects trading.
+        asyncio.create_task(backup.push_to_gist(self.trades_file))
         asyncio.create_task(self._post_close(strategy))
 
     async def _post_close(self, strategy: dict) -> None:
