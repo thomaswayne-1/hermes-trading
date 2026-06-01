@@ -159,7 +159,15 @@ def render_terminal(state: dict, closed: list) -> None:
     bb      = float(hb.get("bb_pct",       0.5))
     atr     = float(hb.get("atr",          0))
     ob_imb  = float(hb.get("ob_imbalance", 0))
-    ts      = hb.get("ts", "")[:19].replace("T", " ")
+    # Convert UTC heartbeat timestamp → local time for display
+    _ts_raw = hb.get("ts", "")
+    try:
+        _dt = datetime.fromisoformat(_ts_raw)
+        if _dt.tzinfo is None:
+            _dt = _dt.replace(tzinfo=timezone.utc)
+        ts = _dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        ts = _ts_raw[:19].replace("T", " ")
 
     C       = float(eng.get("C",           0))
     K       = float(eng.get("K",           0))
@@ -196,13 +204,14 @@ def render_terminal(state: dict, closed: list) -> None:
         raw = (price - ep) / ep if t["direction"] == "long" else (ep - price) / ep
         total_unreal += raw * lev * sz * balance
 
+    now_local = datetime.now().strftime("%H:%M:%S")
     stale_tag = f"  ⚠ STALE since {_cache['stale_since']}" if _cache["stale"] else ""
 
     # ── Print ─────────────────────────────────────────────────────────────────
     print("\033[2J\033[H", end="")   # clear screen
     print("━" * W)
     mode = "LIVE" if engine_live else "SHADOW"
-    print(f"  HERMES  [{mode}]  v{version}{stale_tag}")
+    print(f"  HERMES  [{mode}]  v{version}   local {now_local}{stale_tag}")
     print("━" * W)
 
     # One-liner status (matches tracker format)
