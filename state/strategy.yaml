@@ -5,7 +5,7 @@ version: "09"
 #         RSI-gatekeeper logic still drives entries and sizing.
 # true  → engine fully drives entries, sizing, and coefficient-aware exits.
 #         Legacy RSI logic is bypassed.
-coefficient_engine_enabled: false
+coefficient_engine_enabled: true
 
 # Master kill switch — false runs the entire stack in paper mode (already the case).
 live_trading: false
