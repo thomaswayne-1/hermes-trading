@@ -22,6 +22,7 @@ import json
 import os
 import ssl
 import time
+import traceback
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -584,6 +585,7 @@ def main() -> None:
             break
         except Exception as exc:
             print(f"  [{datetime.now().strftime('%H:%M:%S')}] error — {exc}")
+            traceback.print_exc()
         time.sleep(INTERVAL)
 
 
