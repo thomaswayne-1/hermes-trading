@@ -572,6 +572,9 @@ def write_csvs(state: dict, closed: list) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+ERROR_LOG = BASE / "hermes_error.log"
+
+
 def main() -> None:
     print(f"HERMES Monitor — connecting to {RAILWAY_URL}")
     print("Writing position.csv / stats.csv / trades.csv / model.csv\n")
@@ -584,8 +587,15 @@ def main() -> None:
             print("\nStopped.")
             break
         except Exception as exc:
-            print(f"  [{datetime.now().strftime('%H:%M:%S')}] error — {exc}")
-            traceback.print_exc()
+            now = datetime.now().strftime("%H:%M:%S")
+            tb_str = traceback.format_exc()
+            # Write to log file (persists across screen clears)
+            with open(ERROR_LOG, "a") as f:
+                f.write(f"\n[{now}] {exc}\n{tb_str}\n")
+            # Print WITHOUT triggering a screen clear
+            print(f"\n  [{now}] error — {exc}")
+            print(tb_str)
+            print(f"  (full traceback saved to hermes_error.log)")
         time.sleep(INTERVAL)
 
 
