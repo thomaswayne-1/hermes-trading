@@ -75,6 +75,7 @@ class TradingLoop:
         self.engine_state_file = state_dir / "engine_state.json"
 
         self._consecutive_failures = 0
+        self._last_error: dict | None = None
 
         # Multiple concurrent positions — restored from disk on startup
         self._open_trades: list[dict] = []
@@ -134,17 +135,51 @@ class TradingLoop:
             try:
                 await self._tick()
                 self._consecutive_failures = 0
+                self._last_error = None
             except SchemaError as exc:
-                log.error("SCHEMA ERROR — halting loop: %s", exc)
-                raise
-            except Exception as exc:  # noqa: BLE001
+                # No longer fatal — adapter schema drift would have crashed the
+                # whole bot. Record + carry on.
+                import traceback
                 self._consecutive_failures += 1
-                log.warning("Tick error (%d/%d): %s",
-                            self._consecutive_failures, CIRCUIT_BREAK_THRESHOLD, exc)
+                self._last_error = {
+                    "ts":   datetime.now(timezone.utc).isoformat(),
+                    "type": "SchemaError",
+                    "msg":  str(exc),
+                    "tb":   traceback.format_exc()[-1500:],
+                }
+                log.error("SCHEMA ERROR (continuing): %s", exc)
+            except Exception as exc:  # noqa: BLE001
+                import traceback
+                self._consecutive_failures += 1
+                self._last_error = {
+                    "ts":   datetime.now(timezone.utc).isoformat(),
+                    "type": type(exc).__name__,
+                    "msg":  str(exc),
+                    "tb":   traceback.format_exc()[-1500:],
+                }
+                log.warning("Tick error (%d/%d) %s: %s",
+                            self._consecutive_failures, CIRCUIT_BREAK_THRESHOLD,
+                            type(exc).__name__, exc)
+                # Persist the error to heartbeat so /state shows it remotely
+                self._write_error_to_heartbeat()
                 if self._consecutive_failures >= CIRCUIT_BREAK_THRESHOLD:
                     log.error("Circuit breaker tripped — halting.")
                     raise RuntimeError("Circuit breaker tripped") from exc
             await asyncio.sleep(TICK_SECONDS)
+
+    def _write_error_to_heartbeat(self) -> None:
+        """Inject last_error into heartbeat.json so /state shows it remotely."""
+        try:
+            existing = json.loads(self.heartbeat_file.read_text())
+        except Exception:
+            existing = {}
+        existing["last_error"] = self._last_error
+        existing["consecutive_failures"] = self._consecutive_failures
+        try:
+            with open(self.heartbeat_file, "w") as f:
+                json.dump(existing, f, indent=2)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     #  Single tick                                                         #
