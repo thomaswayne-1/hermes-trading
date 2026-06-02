@@ -81,13 +81,8 @@ class TradingLoop:
         self._peak_prices: dict[str, float] = {}
         self._trough_prices: dict[str, float] = {}   # for MAE tracking
 
-        # GitHub Gist restore: if trades.jsonl is empty, pull from backup Gist.
-        # This runs synchronously before the event loop so it's safe to use
-        # httpx.Client here.  Errors are non-fatal (logged as warnings).
-        restored = backup.restore_from_gist(self.trades_file)
-        if restored:
-            log.info("STARTUP | Loaded %d trade(s) from GitHub Gist backup", restored)
-
+        # Gist restore is deferred to _startup_restore() which runs async
+        # inside run_forever() — keeps __init__ fast so Railway health check passes.
         self._restore_open_trades()
 
         self._last_entry_time: float = (
@@ -132,6 +127,9 @@ class TradingLoop:
 
     async def run_forever(self) -> None:
         log.info("Loop started — tick every %ds", TICK_SECONDS)
+        # Async Gist restore — runs after the event loop and API server are up
+        # so Railway's health check passes immediately.
+        await self._startup_restore()
         while True:
             try:
                 await self._tick()
@@ -829,6 +827,24 @@ class TradingLoop:
             self._open_trades   = []
             self._peak_prices   = {}
             self._trough_prices = {}
+
+    async def _startup_restore(self) -> None:
+        """
+        Restore trade history from GitHub Gist if trades.jsonl is empty.
+        Called once at the start of run_forever() — after the event loop is
+        running — so __init__ stays fast and Railway health checks pass.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            restored = await loop.run_in_executor(
+                None, backup.restore_from_gist, self.trades_file
+            )
+            if restored:
+                log.info("STARTUP | Restored %d trade(s) from GitHub Gist", restored)
+                # Reload open trades in case they reference restored history
+                self._restore_open_trades()
+        except Exception as exc:
+            log.warning("STARTUP | Gist restore failed (non-fatal): %s", exc)
 
     async def _maybe_reflect(self) -> None:
         """Legacy reflect cycle — only used when coefficient_engine_enabled = false."""
