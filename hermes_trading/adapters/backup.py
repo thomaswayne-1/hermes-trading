@@ -166,7 +166,14 @@ async def push_to_gist(trades_file: Path) -> None:
     if not content.strip():
         return
 
-    gist_id = _resolve_gist_id(trades_file, token)
+    # _resolve_gist_id uses synchronous httpx — run in a thread so we don't
+    # block the event loop while scanning GitHub Gists.
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+        gist_id = await loop.run_in_executor(None, _resolve_gist_id, trades_file, token)
+    except Exception:
+        gist_id = ""
     n_lines = len([l for l in content.splitlines() if l.strip()])
 
     payload: dict = {

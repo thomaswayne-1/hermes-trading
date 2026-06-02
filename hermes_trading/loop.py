@@ -127,9 +127,9 @@ class TradingLoop:
 
     async def run_forever(self) -> None:
         log.info("Loop started — tick every %ds", TICK_SECONDS)
-        # Async Gist restore — runs after the event loop and API server are up
-        # so Railway's health check passes immediately.
-        await self._startup_restore()
+        # Fire-and-forget: Gist restore runs in the background so the main
+        # trading loop starts immediately and heartbeats are written from tick 1.
+        asyncio.create_task(self._startup_restore())
         while True:
             try:
                 await self._tick()
@@ -154,8 +154,18 @@ class TradingLoop:
         now_iso = datetime.now(timezone.utc).isoformat()
         now_ts  = time.time()
 
-        # Core data (price + extras + funding + sentiment)
-        data = await self._fetch_all()
+        # Write a minimal heartbeat immediately so the monitor always shows a
+        # fresh timestamp — even if _fetch_all hangs for a full tick cycle.
+        self._write_heartbeat_alive(now_iso)
+
+        # Core data — hard 25s timeout so a hung adapter can't stall the loop.
+        try:
+            data = await asyncio.wait_for(self._fetch_all(), timeout=25.0)
+        except asyncio.TimeoutError:
+            log.warning("_fetch_all timed out after 25s — skipping tick")
+            self._write_heartbeat(now_iso, {}, "?", self._last_snapshot)
+            return
+
         strategy = self._load_strategy()
 
         price_data     = data.get("price", {})
@@ -940,6 +950,24 @@ class TradingLoop:
         }
         with open(self.heartbeat_file, "w") as f:
             json.dump(hb, f, indent=2)
+
+    def _write_heartbeat_alive(self, ts: str) -> None:
+        """
+        Write a minimal heartbeat at the START of each tick — before waiting
+        for adapters — so the monitor always shows a fresh timestamp even if
+        _fetch_all() hangs.  Preserves the previous price/engine data so the
+        monitor never goes blank.
+        """
+        try:
+            existing = json.loads(self.heartbeat_file.read_text())
+        except Exception:
+            existing = {}
+        existing["ts"] = ts   # stamp as of NOW
+        try:
+            with open(self.heartbeat_file, "w") as f:
+                json.dump(existing, f, indent=2)
+        except Exception:
+            pass   # non-fatal
 
     # ------------------------------------------------------------------ #
     #  Adapter fetches                                                     #

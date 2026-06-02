@@ -59,6 +59,28 @@ def _get(path: str):
         return json.loads(r.read())
 
 
+def _live_btc_price() -> float:
+    """
+    Fetch a live BTC/USD price directly from Kraken's public ticker.
+    Used when the Railway heartbeat is stale (server-side loop down).
+    Returns 0.0 on any error.
+    """
+    try:
+        req = urllib.request.Request(
+            "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
+            headers={"User-Agent": "hermes-monitor/1.0"},
+        )
+        with urllib.request.urlopen(req, context=_SSL, timeout=5) as r:
+            data = json.loads(r.read())
+        result = data.get("result", {})
+        key = next((k for k in result if k != "last"), None)
+        if key:
+            return float(result[key]["c"][0])
+    except Exception:
+        pass
+    return 0.0
+
+
 # ── Last-known-good cache ─────────────────────────────────────────────────────
 
 _cache: dict = {
@@ -174,6 +196,21 @@ def render_terminal(state: dict, closed: list) -> None:
     bb     = float(hb.get("bb_pct",       0.5))
     atr    = float(hb.get("atr",          0))
     ob_imb = float(hb.get("ob_imbalance", 0))
+
+    # If the server heartbeat is stale, fetch a live BTC price directly
+    # from Kraken so the monitor always shows an accurate price.
+    _ts_raw_pre = hb.get("ts", "")
+    try:
+        _dt_pre = datetime.fromisoformat(_ts_raw_pre)
+        if _dt_pre.tzinfo is None:
+            _dt_pre = _dt_pre.replace(tzinfo=timezone.utc)
+        _pre_age = (datetime.now(timezone.utc) - _dt_pre).total_seconds()
+    except Exception:
+        _pre_age = 9999
+    if _pre_age > 60:
+        _live = _live_btc_price()
+        if _live > 0:
+            price = _live
 
     # UTC heartbeat -> local time + age
     _ts_raw = hb.get("ts", "")
