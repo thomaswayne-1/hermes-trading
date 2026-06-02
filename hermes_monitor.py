@@ -44,8 +44,6 @@ BASE        = Path(__file__).parent
 W           = 60   # terminal display width
 
 _SSL = ssl.create_default_context()
-_SSL.check_hostname = False
-_SSL.verify_mode    = ssl.CERT_NONE
 
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -98,11 +96,20 @@ def fetch_all():
             trades = trades.get("trades", [])
         closed = [t for t in trades if t.get("closed")]
 
-        # Never trust a response with fewer closed trades than cache
-        if len(closed) < len(_cache["trades"]):
+        # Stale-rejection guard: compare highest trade ID seen so far rather
+        # than trade count.  A lower count is legitimate (volume wipe, operator
+        # cleanup); a lower max-ID means something is wrong (e.g. full reset
+        # returning a blank list after a known trade was committed).
+        def _max_id(tlist: list) -> str:
+            ids = [t.get("id", "") for t in tlist if t.get("id")]
+            return max(ids) if ids else ""
+
+        new_max  = _max_id(closed)
+        prev_max = _max_id(_cache["trades"])
+        if prev_max and new_max and new_max < prev_max:
             raise ValueError(
-                f"Response has {len(closed)} closed trades but cache has "
-                f"{len(_cache['trades'])} — likely a redeploy blip"
+                f"Response max trade ID {new_max!r} is behind cache max "
+                f"{prev_max!r} — likely a redeploy blip"
             )
 
         _cache.update({"state": state, "trades": closed,

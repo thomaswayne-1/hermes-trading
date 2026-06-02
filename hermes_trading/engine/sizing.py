@@ -81,6 +81,7 @@ def fractional_kelly_size(
     size_floor: float = 0.05,
     size_cap: float = 0.40,
     bucket_min_samples: int = 50,
+    floor_threshold: float = 0.12,
 ) -> tuple[float, str]:
     """
     Return (position_size_fraction, source_label).
@@ -121,10 +122,10 @@ def fractional_kelly_size(
                 return (max(size_floor, min(size_cap, f)), "kelly_binary_neighbor")
 
     # Insufficient data or negative Kelly edge.
-    # If the directional signal is strong (|C| > 0.30), still take the floor
-    # size so the engine can build up trade history. signal = |C|·K is usually
-    # 0.05–0.15 so a signal-based threshold of 0.4 is unreachable in practice.
-    if abs(C) > 0.30:
+    # Take floor size whenever |C| exceeds the entry threshold so the engine
+    # can accumulate trade history from the first entry. The floor_threshold
+    # defaults to tau_enter (0.12) and is passed in from _maybe_open_engine.
+    if abs(C) > floor_threshold:
         return (size_floor, "floor_strong_signal")
     return (0.0, "skip_no_edge")
 

@@ -77,6 +77,24 @@ class TradingLoop:
         self._consecutive_failures = 0
         self._last_error: dict | None = None
 
+        # Strong references to fire-and-forget background tasks so the GC
+        # cannot collect them before they complete.
+        self._background_tasks: set[asyncio.Task] = set()
+
+        # Snapshot the trades file byte-size at process start so the Gist
+        # restore guard uses the pre-loop value (not the post-tick 1 value).
+        self._trades_init_size: int = (
+            self.trades_file.stat().st_size
+            if self.trades_file.exists() else 0
+        )
+
+        # Snapshot open_trades mtime at init so _startup_restore can detect
+        # whether the trading loop has mutated it before calling _restore_open_trades.
+        self._open_trades_init_mtime: float | None = (
+            self.open_trades_file.stat().st_mtime
+            if self.open_trades_file.exists() else None
+        )
+
         # Multiple concurrent positions — restored from disk on startup
         self._open_trades: list[dict] = []
         self._peak_prices: dict[str, float] = {}
@@ -126,28 +144,34 @@ class TradingLoop:
     #  Main loop                                                           #
     # ------------------------------------------------------------------ #
 
+    def _create_task(self, coro) -> asyncio.Task:
+        """
+        Create a background task and keep a strong reference to it.
+        Without a strong ref the GC can cancel the task before it finishes.
+        The done-callback removes the ref once the task completes.
+        """
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def run_forever(self) -> None:
         log.info("Loop started — tick every %ds", TICK_SECONDS)
         # Fire-and-forget: Gist restore runs in the background so the main
         # trading loop starts immediately and heartbeats are written from tick 1.
-        asyncio.create_task(self._startup_restore())
+        self._create_task(self._startup_restore())
         while True:
             try:
                 await self._tick()
                 self._consecutive_failures = 0
                 self._last_error = None
-            except SchemaError as exc:
-                # No longer fatal — adapter schema drift would have crashed the
-                # whole bot. Record + carry on.
-                import traceback
-                self._consecutive_failures += 1
-                self._last_error = {
-                    "ts":   datetime.now(timezone.utc).isoformat(),
-                    "type": "SchemaError",
-                    "msg":  str(exc),
-                    "tb":   traceback.format_exc()[-1500:],
-                }
-                log.error("SCHEMA ERROR (continuing): %s", exc)
+            except SchemaError:
+                # SchemaError means the adapter contract changed — the engine
+                # cannot make valid decisions with malformed data.  Re-raise so
+                # the outer Exception handler records it, increments the circuit
+                # breaker, and (if it trips) halts cleanly rather than silently
+                # trading on garbage inputs.
+                raise
             except Exception as exc:  # noqa: BLE001
                 import traceback
                 self._consecutive_failures += 1
@@ -176,8 +200,7 @@ class TradingLoop:
         existing["last_error"] = self._last_error
         existing["consecutive_failures"] = self._consecutive_failures
         try:
-            with open(self.heartbeat_file, "w") as f:
-                json.dump(existing, f, indent=2)
+            self._atomic_write_json(self.heartbeat_file, existing)
         except Exception:
             pass
 
@@ -198,7 +221,9 @@ class TradingLoop:
             data = await asyncio.wait_for(self._fetch_all(), timeout=25.0)
         except asyncio.TimeoutError:
             log.warning("_fetch_all timed out after 25s — skipping tick")
-            self._write_heartbeat(now_iso, {}, "?", self._last_snapshot)
+            # _write_heartbeat_alive already stamped ts at the top of this tick.
+            # Do NOT call _write_heartbeat here — it would overwrite price/regime
+            # with empty values and make the monitor show zeros.
             return
 
         strategy = self._load_strategy()
@@ -284,6 +309,8 @@ class TradingLoop:
                     strategy=strategy, now_iso=now_iso, now_ts=now_ts,
                     funding_rate=funding_rate, fng_value=fng_value,
                     closed_trades=closed_trades_so_far,
+                    rsi=rsi, macd_hist=macd_hist,
+                    bb_pct=bb_pct, ob_imbalance=ob_imbalance,
                 )
             elif not engine_on:
                 self._maybe_open_legacy(
@@ -297,7 +324,7 @@ class TradingLoop:
         # ── Background tasks ──────────────────────────────────────────────────
         self._tick_count += 1
         if self._tick_count % 30 == 0:
-            asyncio.create_task(self._run_model())
+            self._create_task(self._run_model())
 
         self._write_heartbeat(now_iso, price_data, strategy.get("version", "?"), snapshot)
         self.engine.save_state(self.engine_state_file)
@@ -499,8 +526,8 @@ class TradingLoop:
         self._append_trade(closed)
         # Fire-and-forget: push updated trade history to GitHub Gist.
         # Non-blocking — a push failure never affects trading.
-        asyncio.create_task(backup.push_to_gist(self.trades_file))
-        asyncio.create_task(self._post_close(strategy))
+        self._create_task(backup.push_to_gist(self.trades_file))
+        self._create_task(self._post_close(strategy))
 
     async def _post_close(self, strategy: dict) -> None:
         """Run improvement cycles + model refresh after a trade closes."""
@@ -519,7 +546,7 @@ class TradingLoop:
         if engine_on and n > 0 and n % cadence == 0 and n != self._last_fast_cycle_at:
             self._last_fast_cycle_at = n
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None,
                     run_fast_cycle,
@@ -533,7 +560,7 @@ class TradingLoop:
             # Legacy reflect path
             await self._maybe_reflect()
 
-        asyncio.create_task(self._run_model())
+        self._create_task(self._run_model())
 
     # ------------------------------------------------------------------ #
     #  Entry — engine path                                                 #
@@ -543,6 +570,8 @@ class TradingLoop:
         self, *, snapshot: dict, current_price: float, strategy: dict,
         now_iso: str, now_ts: float, funding_rate: float, fng_value: float,
         closed_trades: list[dict],
+        rsi: float = 50.0, macd_hist: float = 0.0,
+        bb_pct: float = 0.5, ob_imbalance: float = 0.0,
     ) -> None:
         C = float(snapshot["C"])
         K = float(snapshot["K"])
@@ -580,6 +609,7 @@ class TradingLoop:
             size_floor=float(siz_cfg.get("size_floor", 0.05)),
             size_cap=float(siz_cfg.get("size_cap", 0.40)),
             bucket_min_samples=int(guard_cfg.get("kelly_bucket_min_samples", 50)),
+            floor_threshold=tau_enter,
         )
         if size <= 0:
             return
@@ -617,11 +647,11 @@ class TradingLoop:
             "entry_vol_forecast":  snapshot["vol_forecast"],
             "entry_funding":       funding_rate,
             "entry_fng":           fng_value,
-            # Indicators for legacy MACD-reversal exit + analysis
-            "entry_macd_hist":     None,   # filled below from snapshot if available
-            "entry_rsi":           None,
-            "entry_bb_pct":        None,
-            "entry_ob_imb":        None,
+            # Indicators for MACD-reversal exit + analysis
+            "entry_macd_hist":     round(macd_hist,  6),
+            "entry_rsi":           round(rsi,        4),
+            "entry_bb_pct":        round(bb_pct,     4),
+            "entry_ob_imb":        round(ob_imbalance, 4),
         }
 
         self._open_trades.append(trade)
@@ -875,19 +905,35 @@ class TradingLoop:
 
     async def _startup_restore(self) -> None:
         """
-        Restore trade history from GitHub Gist if trades.jsonl is empty.
-        Called once at the start of run_forever() — after the event loop is
-        running — so __init__ stays fast and Railway health checks pass.
+        Restore trade history from GitHub Gist if trades.jsonl was empty at
+        process start.  Called once at the start of run_forever() — after the
+        event loop is running — so __init__ stays fast and Railway health
+        checks pass.
         """
+        import functools
         try:
-            loop = asyncio.get_event_loop()
-            restored = await loop.run_in_executor(
-                None, backup.restore_from_gist, self.trades_file
+            loop = asyncio.get_running_loop()
+            fn = functools.partial(
+                backup.restore_from_gist,
+                self.trades_file,
+                init_byte_size=self._trades_init_size,
             )
+            restored = await loop.run_in_executor(None, fn)
             if restored:
                 log.info("STARTUP | Restored %d trade(s) from GitHub Gist", restored)
-                # Reload open trades in case they reference restored history
-                self._restore_open_trades()
+                # Only reload open trades if the loop hasn't already mutated the
+                # file (i.e., no tick has written a trade since __init__ ran).
+                current_mtime: float | None = (
+                    self.open_trades_file.stat().st_mtime
+                    if self.open_trades_file.exists() else None
+                )
+                if current_mtime == self._open_trades_init_mtime:
+                    self._restore_open_trades()
+                else:
+                    log.info(
+                        "STARTUP | open_trades.json changed since init — "
+                        "skipping _restore_open_trades to avoid overwriting live state"
+                    )
         except Exception as exc:
             log.warning("STARTUP | Gist restore failed (non-fatal): %s", exc)
 
@@ -903,11 +949,11 @@ class TradingLoop:
             return
         self._last_reflected_at = closed_count
         log.info("LEGACY REFLECT | trade #%d hit cadence of %d", closed_count, cadence)
-        asyncio.create_task(self._run_reflect())
+        self._create_task(self._run_reflect())
 
     async def _run_model(self) -> None:
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             starting = float(self.goal.get("starting_balance", 100_000))
             await loop.run_in_executor(None, run_mc_model, starting)
         except Exception as exc:
@@ -935,6 +981,23 @@ class TradingLoop:
             except Exception as exc:
                 log.error("reflect %s failed: %s", mode, exc)
         log.error("All reflection modes failed — strategy unchanged")
+
+    @staticmethod
+    def _atomic_write_json(path: Path, data: dict) -> None:
+        """Write JSON atomically via a temp file + os.replace() so a SIGTERM
+        mid-write cannot produce a partial/corrupt JSON file."""
+        import os, tempfile
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w") as fh:
+                json.dump(data, fh, indent=2)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _write_heartbeat(self, ts: str, price_data: dict, strategy_version: str, snapshot: dict) -> None:
         hb = {
@@ -983,8 +1046,7 @@ class TradingLoop:
                 "tripped_at":    self.circuit.tripped_at,
             },
         }
-        with open(self.heartbeat_file, "w") as f:
-            json.dump(hb, f, indent=2)
+        self._atomic_write_json(self.heartbeat_file, hb)
 
     def _write_heartbeat_alive(self, ts: str) -> None:
         """
@@ -999,8 +1061,7 @@ class TradingLoop:
             existing = {}
         existing["ts"] = ts   # stamp as of NOW
         try:
-            with open(self.heartbeat_file, "w") as f:
-                json.dump(existing, f, indent=2)
+            self._atomic_write_json(self.heartbeat_file, existing)
         except Exception:
             pass   # non-fatal
 

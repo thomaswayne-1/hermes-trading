@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -78,7 +80,20 @@ class CoefficientEngine:
                 # Regime classifier vol history
                 "regime_vol_history": list(self.regime._vol_history),
             }
-            path.write_text(json.dumps(state))
+            # Atomic write: write to a temp file in the same directory, then
+            # rename.  os.replace() is atomic on POSIX so a SIGTERM mid-write
+            # cannot produce a partial/corrupt engine_state.json.
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(tmp_fd, "w") as fh:
+                    fh.write(json.dumps(state))
+                os.replace(tmp_path, path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         except Exception:
             pass   # non-fatal
 
@@ -92,6 +107,13 @@ class CoefficientEngine:
             return False
         try:
             state = json.loads(path.read_text())
+
+            # Clear all buffers before restoring — ensures load_state is
+            # idempotent and never double-appends on a second call.
+            self.features._buf.clear()
+            self.vol._return_buf.clear()
+            self.vol._var_history.clear()
+            self.regime._vol_history.clear()
 
             # FeatureBuffer
             buf_data = state.get("feature_buffer", [])
@@ -112,7 +134,6 @@ class CoefficientEngine:
                 self.regime._vol_history.append(float(v))
 
             # Last price
-            self.vol._var = float(state.get("ewma", {}).get("var", self.vol._var))
             lp = state.get("last_price", 0.0)
             if lp:
                 self._last_price = float(lp)

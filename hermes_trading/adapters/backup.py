@@ -18,11 +18,24 @@ Gist management:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
 
 import httpx
+
+# Module-level lock: prevents two concurrent push_to_gist calls from both
+# seeing gist_id = "" and independently POSTing to create duplicate Gists.
+_gist_create_lock: asyncio.Lock | None = None
+
+
+def _get_lock() -> asyncio.Lock:
+    """Return (creating if needed) the module-level asyncio.Lock."""
+    global _gist_create_lock
+    if _gist_create_lock is None:
+        _gist_create_lock = asyncio.Lock()
+    return _gist_create_lock
 
 log = logging.getLogger("hermes.backup")
 
@@ -96,10 +109,16 @@ def _resolve_gist_id(trades_file: Path, token: str) -> str:
 
 # ── Synchronous restore (called at startup, before the async event loop) ──────
 
-def restore_from_gist(trades_file: Path) -> int:
+def restore_from_gist(trades_file: Path, *, init_byte_size: int = -1) -> int:
     """
     If trades_file is empty AND GITHUB_TOKEN is set, fetch trade history from
     the backup Gist and write it to trades_file.
+
+    init_byte_size: byte count of trades_file measured at process start
+        (before the trading loop began writing).  Pass this from the caller
+        to avoid a race where tick 1 writes a trade before this function runs,
+        causing the guard to incorrectly skip restore.
+        If -1 (default / caller didn't pass it), fall back to current size.
 
     Returns the number of trade lines restored (0 if nothing done).
     """
@@ -107,10 +126,15 @@ def restore_from_gist(trades_file: Path) -> int:
     if not token:
         return 0
 
-    # Only restore into an empty file — never overwrite existing data.
-    if trades_file.exists() and trades_file.stat().st_size > 0:
-        existing_lines = len([l for l in trades_file.read_text().splitlines() if l.strip()])
-        log.debug("BACKUP | trades.jsonl has %d lines — skipping restore", existing_lines)
+    # Guard: only restore into a file that was empty when this process started.
+    # Using init_byte_size (snapshotted before the trading loop started) rather
+    # than current size prevents a race where tick 1 beats _startup_restore and
+    # permanently locks out the Gist restore.
+    check_size = init_byte_size if init_byte_size >= 0 else (
+        trades_file.stat().st_size if trades_file.exists() else 0
+    )
+    if check_size > 0:
+        log.debug("BACKUP | trades.jsonl had %d bytes at startup — skipping restore", check_size)
         return 0
 
     gist_id = _resolve_gist_id(trades_file, token)
@@ -168,7 +192,6 @@ async def push_to_gist(trades_file: Path) -> None:
 
     # _resolve_gist_id uses synchronous httpx — run in a thread so we don't
     # block the event loop while scanning GitHub Gists.
-    import asyncio
     try:
         loop = asyncio.get_running_loop()
         gist_id = await loop.run_in_executor(None, _resolve_gist_id, trades_file, token)
@@ -191,18 +214,41 @@ async def push_to_gist(trades_file: Path) -> None:
                 resp.raise_for_status()
                 log.info("BACKUP | ✓ Pushed %d trade(s) to Gist %s", n_lines, gist_id)
             else:
-                payload["description"] = GIST_DESC
-                payload["public"]      = False
-                resp = await client.post(
-                    f"{GITHUB_API}/gists",
-                    headers=_headers(token),
-                    json=payload,
-                )
-                resp.raise_for_status()
-                new_id = resp.json().get("id", "")
-                if new_id:
-                    _gist_id_path(trades_file).write_text(new_id)
-                    log.info("BACKUP | ✓ Created Gist %s with %d trade(s)", new_id, n_lines)
+                # Serialise creation: hold the module-level lock so two
+                # concurrent fire-and-forget push_to_gist calls cannot both
+                # see gist_id="" and independently POST two new Gists.
+                async with _get_lock():
+                    # Re-check inside the lock — another coroutine may have
+                    # just created the Gist and written gist_id.txt.
+                    try:
+                        gist_id = await loop.run_in_executor(
+                            None, _resolve_gist_id, trades_file, token
+                        )
+                    except Exception:
+                        gist_id = ""
+
+                    if gist_id:
+                        # Another coroutine beat us; just PATCH instead.
+                        resp = await client.patch(
+                            f"{GITHUB_API}/gists/{gist_id}",
+                            headers=_headers(token),
+                            json=payload,
+                        )
+                        resp.raise_for_status()
+                        log.info("BACKUP | ✓ Pushed %d trade(s) to Gist %s (lock re-check)", n_lines, gist_id)
+                    else:
+                        payload["description"] = GIST_DESC
+                        payload["public"]      = False
+                        resp = await client.post(
+                            f"{GITHUB_API}/gists",
+                            headers=_headers(token),
+                            json=payload,
+                        )
+                        resp.raise_for_status()
+                        new_id = resp.json().get("id", "")
+                        if new_id:
+                            _gist_id_path(trades_file).write_text(new_id)
+                            log.info("BACKUP | ✓ Created Gist %s with %d trade(s)", new_id, n_lines)
 
     except Exception as exc:
         log.warning("BACKUP | Push failed (non-fatal): %s", exc)
