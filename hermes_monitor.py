@@ -11,6 +11,7 @@ Every 10 seconds:
   - Renders full engine monitor to terminal (regime, C/K, sub-signals,
     open positions, performance)
   - Writes position.csv, stats.csv, model.csv, trades.csv
+  - Writes hermes_trades.xlsx  (Trades + Performance sheets, Arial font)
 
 Environment (optional — auto-detected):
     RAILWAY_URL   default: https://hermes-trading-production-169f.up.railway.app
@@ -28,6 +29,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from openpyxl import Workbook
+from openpyxl.styles import (
+    Alignment, Border, Font, PatternFill, Side
+)
+from openpyxl.utils import get_column_letter
 
 # ── Config ────────────────────────────────────────────────────────────────────
 RAILWAY_URL = os.getenv("RAILWAY_URL", "https://hermes-trading-production-169f.up.railway.app").rstrip("/")
@@ -582,6 +588,289 @@ def write_csvs(state: dict, closed: list) -> None:
     _write_csv("model.csv", model_rows)
 
 
+# ── Excel spreadsheet ─────────────────────────────────────────────────────────
+
+def _xl_font(bold=False, size=10, color="000000") -> Font:
+    return Font(name="Arial", bold=bold, size=size, color=color)
+
+def _xl_fill(hex_color: str) -> PatternFill:
+    return PatternFill("solid", fgColor=hex_color)
+
+def _xl_border_bottom() -> Border:
+    thin = Side(style="thin", color="CCCCCC")
+    return Border(bottom=thin)
+
+def _xl_header_border() -> Border:
+    thin  = Side(style="thin", color="999999")
+    thick = Side(style="medium", color="555555")
+    return Border(bottom=thick, top=thin)
+
+def _xl_set_col_width(ws, col: int, width: float) -> None:
+    ws.column_dimensions[get_column_letter(col)].width = width
+
+
+def write_xlsx(state: dict, closed: list) -> None:
+    """Write hermes_trades.xlsx with Trades and Performance sheets."""
+    hb      = state.get("heartbeat", {})
+    strat   = state.get("strategy",  {})
+    goal    = state.get("goal",      {})
+    eng     = hb.get("engine", {})
+
+    price         = float(hb.get("price", 0))
+    open_trades   = hb.get("open_trades", [])
+    starting      = float(goal.get("starting_balance", STARTING))
+    engine_live   = bool(strat.get("coefficient_engine_enabled", False))
+    max_pos       = int(strat.get("max_open_positions", 7))
+
+    balance, dolls = _calc_balance(closed)
+    net_pnl        = balance - starting
+    n              = len(closed)
+    wins           = sum(1 for t in closed if _net(t) > 0)
+    wr             = wins / n if n else 0.0
+
+    # Unrealised across open positions
+    unrealised = 0.0
+    for t in open_trades:
+        ep  = float(t.get("entry_price", price) or price)
+        lev = float(t.get("leverage", 1.5))
+        sz  = float(t.get("size") or t.get("position_size_r", 0.15))
+        if ep > 0 and price > 0:
+            raw = (price - ep) / ep if t.get("direction") == "long" else (ep - price) / ep
+            unrealised += raw * lev * sz * balance
+    eq = balance + unrealised
+
+    # Timestamp freshness
+    _ts_raw = hb.get("ts", "")
+    try:
+        _dt = datetime.fromisoformat(_ts_raw)
+        if _dt.tzinfo is None:
+            _dt = _dt.replace(tzinfo=timezone.utc)
+        hb_local = _dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        data_age = int((datetime.now(timezone.utc) - _dt).total_seconds())
+        age_str  = f"{data_age}s old"
+    except Exception:
+        hb_local = _ts_raw[:19].replace("T", " ")
+        age_str  = "?"
+
+    updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    wb = Workbook()
+
+    # ── Sheet 1: Trades ───────────────────────────────────────────────────────
+    ws = wb.active
+    ws.title = "Trades"
+    ws.sheet_view.showGridLines = False
+
+    # Freeze top 2 rows (title + header)
+    ws.freeze_panes = "A3"
+
+    # Title row
+    ws.merge_cells("A1:M1")
+    title_cell = ws["A1"]
+    title_cell.value = f"Hermes Trades   |   Updated {updated}   |   Data {age_str}"
+    title_cell.font  = _xl_font(bold=True, size=11)
+    title_cell.fill  = _xl_fill("FFFFFF")
+    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 22
+
+    # Column headers
+    HEADERS = [
+        "#", "Direction", "Score", "Entry Price", "Exit Price",
+        "PnL $", "PnL %", "Balance After", "Exit Reason",
+        "Strategy", "Leverage", "Entry Time", "Exit Time",
+    ]
+    COL_WIDTHS = [5, 11, 8, 14, 14, 14, 10, 16, 18, 11, 10, 20, 20]
+
+    for col, (h, w) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
+        c = ws.cell(row=2, column=col, value=h)
+        c.font      = _xl_font(bold=True, size=10)
+        c.fill      = _xl_fill("F2F2F2")
+        c.border    = _xl_header_border()
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        _xl_set_col_width(ws, col, w)
+    ws.row_dimensions[2].height = 18
+
+    # Data rows (newest first)
+    if not closed:
+        ws.merge_cells("A3:M3")
+        c = ws.cell(row=3, column=1, value="No closed trades yet.")
+        c.font = _xl_font(size=10, color="888888")
+        c.alignment = Alignment(horizontal="left")
+    else:
+        running = starting
+        for row_i, (t, d) in enumerate(zip(closed, dolls), start=0):
+            running_before = running
+            running += d
+            # Reverse: newest at top
+            display_row = len(closed) - row_i
+            data_row    = 2 + display_row  # row 3 = trade #N (newest), row N+2 = trade #1
+        # Write reversed
+        running = starting
+        running_list = []
+        for d in dolls:
+            running += d
+            running_list.append(running)
+
+        for idx in range(n - 1, -1, -1):
+            t   = closed[idx]
+            d   = dolls[idx]
+            bal = running_list[idx]
+            xr  = 2 + (n - 1 - idx) + 1   # row index in sheet (row 3 = newest)
+
+            pnl_pct = _net(t)
+            is_win  = pnl_pct > 0
+            row_fill = _xl_fill("F6FBF6") if is_win else _xl_fill("FBF6F6")
+            pnl_color = "1A7A1A" if is_win else "B02020"
+
+            values = [
+                idx + 1,
+                t.get("direction", "").upper(),
+                t.get("entry_score", "eng"),
+                t.get("entry_price", 0),
+                t.get("exit_price", 0),
+                d,
+                pnl_pct,
+                bal,
+                t.get("exit_reason", "").replace("_", " "),
+                "v" + str(t.get("strategy_version", "?")),
+                f'{t.get("leverage", 1)}x',
+                t.get("entry_time", ""),
+                t.get("exit_time", ""),
+            ]
+            # Alignment per column: center most, left for text
+            aligns = ["center","center","center","right","right",
+                      "right","right","right","left","center","center","center","center"]
+            for col, (val, al) in enumerate(zip(values, aligns), 1):
+                c = ws.cell(row=xr, column=col, value=val)
+                c.fill      = row_fill
+                c.border    = _xl_border_bottom()
+                c.alignment = Alignment(horizontal=al, vertical="center")
+                # Formatting
+                if col == 4 or col == 5:   # prices
+                    c.number_format = '"$"#,##0.00'
+                    c.font = _xl_font(size=10)
+                elif col == 6:             # PnL $
+                    c.number_format = '"$"#,##0.00;"-$"#,##0.00'
+                    c.font = _xl_font(bold=True, size=10, color=pnl_color)
+                elif col == 7:             # PnL %
+                    c.number_format = '+0.00%;-0.00%'
+                    c.font = _xl_font(bold=True, size=10, color=pnl_color)
+                elif col == 8:             # balance after
+                    c.number_format = '"$"#,##0.00'
+                    c.font = _xl_font(size=10)
+                elif col == 2:             # direction
+                    dir_color = "1A4FA0" if val == "LONG" else "A01A1A"
+                    c.font = _xl_font(bold=True, size=10, color=dir_color)
+                else:
+                    c.font = _xl_font(size=10)
+            ws.row_dimensions[xr].height = 16
+
+    # ── Sheet 2: Performance ─────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Performance")
+    ws2.sheet_view.showGridLines = False
+
+    def perf_title(row, text):
+        ws2.merge_cells(f"A{row}:B{row}")
+        c = ws2.cell(row=row, column=1, value=text)
+        c.font      = _xl_font(bold=True, size=10)
+        c.fill      = _xl_fill("F2F2F2")
+        c.border    = _xl_header_border()
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws2.row_dimensions[row].height = 18
+
+    def perf_row(row, label, value, fmt=None, color=None):
+        lc = ws2.cell(row=row, column=1, value=label)
+        lc.font      = _xl_font(size=10)
+        lc.fill      = _xl_fill("FFFFFF")
+        lc.border    = _xl_border_bottom()
+        lc.alignment = Alignment(horizontal="left", vertical="center")
+
+        vc = ws2.cell(row=row, column=2, value=value)
+        vc.font      = _xl_font(bold=False, size=10, color=color or "000000")
+        vc.fill      = _xl_fill("FFFFFF")
+        vc.border    = _xl_border_bottom()
+        vc.alignment = Alignment(horizontal="right", vertical="center")
+        if fmt:
+            vc.number_format = fmt
+        ws2.row_dimensions[row].height = 16
+
+    ws2.column_dimensions["A"].width = 28
+    ws2.column_dimensions["B"].width = 20
+
+    # Title
+    ws2.merge_cells("A1:B1")
+    t1 = ws2["A1"]
+    t1.value     = f"Performance   |   Updated {updated}"
+    t1.font      = _xl_font(bold=True, size=11)
+    t1.fill      = _xl_fill("FFFFFF")
+    t1.alignment = Alignment(horizontal="left", vertical="center")
+    ws2.row_dimensions[1].height = 22
+
+    r = 2
+
+    # Live feed
+    perf_title(r, "LIVE"); r += 1
+    perf_row(r, "BTC Price",        price,      '"$"#,##0.00'); r += 1
+    perf_row(r, "Last heartbeat",   hb_local                 ); r += 1
+    perf_row(r, "Data age",         age_str                  ); r += 1
+    perf_row(r, "Engine mode",      "LIVE" if engine_live else "SHADOW"); r += 1
+    perf_row(r, "Engine C",         float(eng.get("C", 0)),  '+0.0000'); r += 1
+    perf_row(r, "Engine K",         float(eng.get("K", 0)),  '0.0000' ); r += 1
+    perf_row(r, "Regime",           eng.get("regime", "?")             ); r += 1
+    perf_row(r, "Open positions",   f"{len(open_trades)}/{max_pos}"    ); r += 1
+    r += 1
+
+    # Balance
+    pnl_color_val = "1A7A1A" if eq >= starting else "B02020"
+    perf_title(r, "BALANCE"); r += 1
+    perf_row(r, "Starting balance", starting,   '"$"#,##0.00'); r += 1
+    perf_row(r, "Realised balance", balance,    '"$"#,##0.00'); r += 1
+    perf_row(r, "Unrealised PnL",   unrealised, '"$"+#,##0.00;"-$"#,##0.00'); r += 1
+    perf_row(r, "Total equity",     eq,         '"$"#,##0.00'); r += 1
+    pnl_cell = ws2.cell(row=r, column=2)
+    perf_row(r, "Total PnL $",      eq - starting, '"$"+#,##0.00;"-$"#,##0.00',
+             color=pnl_color_val); r += 1
+    perf_row(r, "Total PnL %",      (eq - starting) / starting if starting else 0,
+             '+0.00%;-0.00%', color=pnl_color_val); r += 1
+    r += 1
+
+    # Stats
+    perf_title(r, "TRADE STATISTICS"); r += 1
+    perf_row(r, "Closed trades",    n); r += 1
+    perf_row(r, "Wins",             wins); r += 1
+    perf_row(r, "Losses",           n - wins); r += 1
+    perf_row(r, "Win rate",         wr, '0.0%'); r += 1
+
+    if n > 0:
+        win_pnls  = [_net(t) for t in closed if _net(t) > 0]
+        loss_pnls = [_net(t) for t in closed if _net(t) <= 0]
+        avg_win   = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0.0
+        avg_loss  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
+        best_pct  = max(_net(t) for t in closed)
+        worst_pct = min(_net(t) for t in closed)
+        best_usd  = max(dolls)
+        worst_usd = min(dolls)
+
+        cum = 1.0; pk = 1.0; dd = 0.0
+        for t in closed:
+            cum *= (1 + _net(t))
+            pk   = max(pk, cum)
+            dd   = max(dd, (pk - cum) / pk)
+
+        perf_row(r, "Avg win %",     avg_win,   '+0.00%;-0.00%', color="1A7A1A"); r += 1
+        perf_row(r, "Avg loss %",    avg_loss,  '+0.00%;-0.00%', color="B02020"); r += 1
+        perf_row(r, "Best trade $",  best_usd,  '"$"+#,##0.00;"-$"#,##0.00',  color="1A7A1A"); r += 1
+        perf_row(r, "Worst trade $", worst_usd, '"$"+#,##0.00;"-$"#,##0.00',  color="B02020"); r += 1
+        perf_row(r, "Max drawdown",  -dd,       '0.00%',                       color="B02020"); r += 1
+
+    path = BASE / "hermes_trades.xlsx"
+    try:
+        wb.save(path)
+    except PermissionError:
+        # File is open in Excel — skip silently this tick
+        pass
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 ERROR_LOG = BASE / "hermes_error.log"
@@ -589,12 +878,13 @@ ERROR_LOG = BASE / "hermes_error.log"
 
 def main() -> None:
     print(f"HERMES Monitor — connecting to {RAILWAY_URL}")
-    print("Writing position.csv / stats.csv / trades.csv / model.csv\n")
+    print("Writing position.csv / stats.csv / trades.csv / model.csv / hermes_trades.xlsx\n")
     while True:
         try:
             state, closed = fetch_all()
             render_terminal(state, closed)
             write_csvs(state, closed)
+            write_xlsx(state, closed)
         except KeyboardInterrupt:
             print("\nStopped.")
             break
