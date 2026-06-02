@@ -152,6 +152,14 @@ def _write_csv(name: str, rows: list) -> None:
 
 # ── Terminal render ───────────────────────────────────────────────────────────
 
+TW = 100   # total terminal width
+
+def _row(label: str, value: str, w: int = TW) -> str:
+    """Left-label, right-value row padded to width."""
+    gap = w - 4 - len(label) - len(value)
+    return f"  {label}{' ' * max(1, gap)}{value}"
+
+
 def render_terminal(state: dict, closed: list) -> None:
     hb    = state.get("heartbeat", {})
     eng   = hb.get("engine", {})
@@ -160,24 +168,32 @@ def render_terminal(state: dict, closed: list) -> None:
     sigs  = eng.get("sub_signals") or {}
     wts   = eng.get("weights_used") or {}
 
-    price   = float(hb.get("price",        0))
-    rsi     = float(hb.get("rsi",          50))
-    macd    = float(hb.get("macd_hist",    0))
-    bb      = float(hb.get("bb_pct",       0.5))
-    atr     = float(hb.get("atr",          0))
-    ob_imb  = float(hb.get("ob_imbalance", 0))
-    # Convert UTC heartbeat timestamp → local time; compute age
+    price  = float(hb.get("price",        0))
+    rsi    = float(hb.get("rsi",          50))
+    macd   = float(hb.get("macd_hist",    0))
+    bb     = float(hb.get("bb_pct",       0.5))
+    atr    = float(hb.get("atr",          0))
+    ob_imb = float(hb.get("ob_imbalance", 0))
+
+    # UTC heartbeat -> local time + age
     _ts_raw = hb.get("ts", "")
-    ts = "?"
-    data_age_s = 0
+    ts = "?"; data_age_s = 0
     try:
         _dt = datetime.fromisoformat(_ts_raw)
         if _dt.tzinfo is None:
             _dt = _dt.replace(tzinfo=timezone.utc)
-        ts = _dt.astimezone().strftime("%H:%M:%S")   # time only — same day as local
+        ts = _dt.astimezone().strftime("%H:%M:%S")
         data_age_s = int((datetime.now(timezone.utc) - _dt).total_seconds())
     except Exception:
         ts = _ts_raw[:19].replace("T", " ")
+
+    if data_age_s <= 15:
+        age_tag = f"  data {data_age_s}s old"
+    elif data_age_s <= 60:
+        age_tag = f"  ** data {data_age_s}s old **"
+    else:
+        _m, _s = data_age_s // 60, data_age_s % 60
+        age_tag = f"  ** DATA {_m}m{_s}s OLD — CHECK CONNECTION **"
 
     C       = float(eng.get("C",           0))
     K       = float(eng.get("K",           0))
@@ -195,147 +211,180 @@ def render_terminal(state: dict, closed: list) -> None:
     max_pos     = int(strat.get("max_open_positions", 7))
     version     = strat.get("version", "?")
     cb_state    = cb.get("state", "normal").upper()
-
     open_trades = hb.get("open_trades", [])
 
-    # Balance + performance
     balance, dolls = _calc_balance(closed)
     n       = len(closed)
     wins    = sum(1 for t in closed if _net(t) > 0)
     wr      = wins / n if n else 0.0
-    net_pnl = balance - STARTING
 
-    # Unrealised
     total_unreal = 0.0
     for t in open_trades:
         ep  = float(t.get("entry_price", price))
         lev = float(t.get("leverage",    1.5))
         sz  = float(t.get("size",        0.15))
-        raw = (price - ep) / ep if t["direction"] == "long" else (ep - price) / ep
+        raw = (price - ep) / ep if t.get("direction") == "long" else (ep - price) / ep
         total_unreal += raw * lev * sz * balance
 
+    eq        = balance + total_unreal
+    total_pnl = eq - STARTING
     now_local = datetime.now().strftime("%H:%M:%S")
-    stale_tag = f"  ⚠ STALE since {_cache['stale_since']}" if _cache["stale"] else ""
+    stale_tag = f"  ** STALE since {_cache['stale_since']} **" if _cache["stale"] else ""
 
-    # Heartbeat freshness tag
-    if data_age_s <= 15:
-        age_tag = f" ({data_age_s}s)"
-    elif data_age_s <= 60:
-        age_tag = f" ⚠ {data_age_s}s old"
-    else:
-        _m, _s = data_age_s // 60, data_age_s % 60
-        age_tag = f" ⚠⚠ {_m}m{_s}s old"
+    D = "=" * TW
 
-    # ── Print ─────────────────────────────────────────────────────────────────
-    print("\033[2J\033[H", end="")   # clear screen
-    print("━" * W)
+    # ── Clear + header ────────────────────────────────────────────────────────
+    print("\033[2J\033[H", end="")
+    print(D)
     mode = "LIVE" if engine_live else "SHADOW"
-    print(f"  HERMES  [{mode}]  v{version}   local {now_local}{stale_tag}")
-    print("━" * W)
+    print(f"  HERMES TRADING  [{mode}]  v{version}"
+          f"{'':>{ TW - 36 - len(version) - len(mode)}}{now_local}")
+    print(D)
 
-    # One-liner status (matches tracker format)
+    # ── Status bar ────────────────────────────────────────────────────────────
+    pnl_sign = "+" if total_pnl >= 0 else ""
+    print(_row(f"BTC  ${price:,.2f}   RSI {rsi:.1f}   {ts}{age_tag}{stale_tag}",
+               f"Equity  ${eq:,.2f}  ({pnl_sign}${total_pnl:,.2f})"))
     if open_trades:
-        pos_str = "  ".join(
-            f"{t['direction'].upper()}@${float(t.get('entry_price',0)):,.0f}"
+        pos_str = "   ".join(
+            f"{t.get('direction','').upper()} @ ${float(t.get('entry_price',0)):,.0f}"
             for t in open_trades
         )
-        status = f"IN TRADE [{pos_str}]"
+        print(_row(f"Status: IN TRADE  [{pos_str}]", f"Closed {n}   WR {wr*100:.0f}%"))
     else:
-        status = "waiting"
-    eq = balance + total_unreal
-    sym = "+" if eq >= STARTING else ""
-    print(f"  {ts}{age_tag}   BTC ${price:,.2f}   RSI {rsi:.1f}")
-    print(f"  Status: {status}   closed={n}   balance=${eq:,.2f}  ({sym}${eq-STARTING:,.2f})")
+        print(_row("Status: waiting", f"Closed {n}   WR {wr*100:.0f}%"))
     print()
 
-    # Engine status
+    # ── Engine ────────────────────────────────────────────────────────────────
+    print(f"  {'─'*4} ENGINE {'─'*( TW - 12)}")
     if not ready:
-        e_status = f"⏳ WARMING UP  ({samps}/200 samples — ~{max(0,(200-samps)*INTERVAL)//60}min)"
+        e_status = f"WARMING UP  ({samps}/200 samples,  ~{max(0,(200-samps)*INTERVAL)//60}min remaining)"
     elif engine_live:
-        e_status = "✅ LIVE & READY"
+        e_status = "LIVE AND READY"
     else:
-        e_status = "👁  SHADOW MODE"
-    print(f"  Engine:  {e_status}")
-    print(f"  Regime:  {reg.upper():12s}  certainty={cert:.2f}   Circuit: {cb_state}")
-    print()
+        e_status = "SHADOW MODE"
+    print(_row(f"Engine:  {e_status}", f"Regime: {reg.upper()}   cert={cert:.2f}   Circuit: {cb_state}"))
 
-    # Signal
-    print(f"  ── Directional Signal {'─'*(W-23)}")
-    direction = "LONG  ▲" if C > 0.05 else ("SHORT ▼" if C < -0.05 else "FLAT  —")
-    print(f"  C = {C:+.4f}  {bar(C, 24)}  {direction}")
-    print(f"  K = {K:.4f}   Agreement={agree:.2f}  VolPenalty={volp:.2f}  VolFcast={volf:.5f}")
-    print()
+    direction = "LONG" if C > 0.05 else ("SHORT" if C < -0.05 else "FLAT")
+    print(_row(f"C = {C:+.4f}  {bar(C, 24)}  {direction}",
+               f"K = {K:.4f}   agree={agree:.2f}   vol_penalty={volp:.2f}   vol_fcast={volf:.5f}"))
 
     if ready:
         if engine_live:
             if abs(C) > tau_enter:
-                print(f"  ► ENTERING {'LONG' if C>0 else 'SHORT'}  "
-                      f"(|C|={abs(C):.4f} > τ={tau_enter})")
+                signal_line = f"SIGNAL: ENTERING {('LONG' if C>0 else 'SHORT')}   |C|={abs(C):.4f} > tau={tau_enter}"
             else:
-                print(f"  ► NO ENTRY  — need +{tau_enter-abs(C):.4f} more  "
-                      f"(|C|={abs(C):.4f} ≤ τ={tau_enter})")
+                signal_line = f"No entry   |C|={abs(C):.4f}  (need +{tau_enter-abs(C):.4f} to reach tau={tau_enter})"
         else:
             side = "LONG" if C > 0 else "SHORT"
-            print(f"  ► SHADOW: {'signal — ' + side if abs(C)>tau_enter else 'no signal'}  "
-                  f"(|C|={abs(C):.4f})")
+            signal_line = (f"Shadow signal: {side}   |C|={abs(C):.4f}" if abs(C)>tau_enter
+                           else f"Shadow: no signal   |C|={abs(C):.4f}")
     else:
-        print(f"  ► Warming up — {200-samps} ticks remaining")
+        signal_line = f"Warming up — {200-samps} ticks to go"
+    print(f"  {signal_line}")
     print()
 
-    # Sub-signals
-    print(f"  ── Sub-signals  [{reg.upper()}] {'─'*max(0,W-20-len(reg))}")
-    for key, label in [("mom","Momentum  "),("rev","Mean-Rev  "),
-                       ("mic","Microstr  "),("sen","Sentiment ")]:
+    # ── Sub-signals ───────────────────────────────────────────────────────────
+    print(f"  {'─'*4} SUB-SIGNALS  [{reg.upper()}] {'─'*(TW - 22 - len(reg))}")
+    for key, label in [("mom","Momentum"),("rev","Mean-Rev"),
+                       ("mic","Microstr"),("sen","Sentiment")]:
         v = float(sigs.get(key, 0))
         w = float(wts.get(key, 0))
-        lean = "▲ bullish" if v > 0.15 else ("▼ bearish" if v < -0.15 else "  neutral")
-        print(f"  {label} {v:+.3f}  {bar(v, 20)}  w={w:.2f}  {lean}")
+        lean = "bullish" if v > 0.15 else ("bearish" if v < -0.15 else "neutral")
+        print(f"  {label:10s}  {v:+.3f}  {bar(v, 20)}  w={w:.2f}  {lean}")
     print()
 
-    # Market indicators
-    print(f"  ── Market Indicators {'─'*(W-22)}")
+    # ── Market indicators ─────────────────────────────────────────────────────
+    print(f"  {'─'*4} MARKET {'─'*(TW - 13)}")
     ob_lbl = "buy pressure" if ob_imb>0.1 else ("sell pressure" if ob_imb<-0.1 else "balanced")
-    bb_lbl = "overbought" if bb>0.8 else ("oversold" if bb<0.2 else f"{bb:.2f}")
-    print(f"  RSI {rsi:5.1f}   MACD {macd:+.4f}   ATR ${atr:.2f}   BB% {bb_lbl}")
-    print(f"  OB imbalance {ob_imb:+.3f}  ({ob_lbl})")
+    bb_lbl = "overbought"   if bb>0.8      else ("oversold"      if bb<0.2      else f"{bb:.2f}")
+    print(_row(f"RSI {rsi:5.1f}   MACD {macd:+.4f}   ATR ${atr:.2f}   BB {bb_lbl}",
+               f"OB imbalance {ob_imb:+.3f}  ({ob_lbl})"))
     print()
 
-    # Open positions
-    print(f"  ── Open Positions ({len(open_trades)}/{max_pos}) {'─'*max(0,W-22)}")
+    # ── Open positions ────────────────────────────────────────────────────────
+    print(f"  {'─'*4} OPEN POSITIONS  ({len(open_trades)}/{max_pos}) {'─'*(TW - 28)}")
     if open_trades:
+        hdr = f"  {'DIR':<6} {'ENTRY':>12}  {'LEV':>5}  {'SIZE':>5}  {'UNREALISED %':>13}  {'UNREALISED $':>13}  {'C':>7}  {'K':>6}"
+        print(hdr)
+        print("  " + "-" * (TW - 2))
         for t in open_trades:
-            ep    = float(t.get("entry_price", price))
-            lev   = float(t.get("leverage",    1.5))
-            sz    = float(t.get("size",        0.15))
-            ec    = t.get("entry_C");  ek = t.get("entry_K")
-            raw   = (price-ep)/ep if t["direction"]=="long" else (ep-price)/ep
+            ep      = float(t.get("entry_price", price))
+            lev     = float(t.get("leverage",    1.5))
+            sz      = float(t.get("size",        0.15))
+            ec      = t.get("entry_C"); ek = t.get("entry_K")
+            raw     = (price-ep)/ep if t.get("direction")=="long" else (ep-price)/ep
             unr_pct = raw * lev * 100
             unr_usd = raw * lev * sz * balance
-            c_str = f"C={ec:+.3f} " if ec is not None else ""
-            k_str = f"K={ek:.3f}"   if ek is not None else ""
-            sym   = "+" if unr_pct >= 0 else ""
-            print(f"  {t['direction'].upper():5s} @ ${ep:>10,.2f}  "
-                  f"lev={lev:.1f}x  sz={sz*100:.0f}%  "
-                  f"{c_str}{k_str}  {sym}{unr_pct:.2f}%  (${sym}{unr_usd:,.0f})")
-        sym = "+" if total_unreal >= 0 else ""
-        print(f"  {'':48s}total {sym}${total_unreal:,.0f}")
+            c_str   = f"{ec:+.3f}" if ec is not None else "  -  "
+            k_str   = f"{ek:.3f}"  if ek is not None else "  - "
+            sgn     = "+" if unr_pct >= 0 else ""
+            print(f"  {t.get('direction','').upper():<6} ${ep:>11,.2f}  {lev:>4.1f}x  {sz*100:>4.0f}%"
+                  f"  {sgn}{unr_pct:>12.2f}%  {sgn}${abs(unr_usd):>11,.0f}  {c_str:>7}  {k_str:>6}")
+        sgn = "+" if total_unreal >= 0 else ""
+        print(f"  {'':>56} Total  {sgn}${abs(total_unreal):>11,.0f}")
     else:
         print("  No open positions")
     print()
 
-    # Performance
-    print(f"  ── Performance {'─'*(W-17)}")
+    # ── Performance summary ───────────────────────────────────────────────────
+    print(f"  {'─'*4} PERFORMANCE {'─'*(TW - 18)}")
     if n > 0:
-        sym = "+" if net_pnl >= 0 else ""
-        print(f"  Closed={n}  WR={wr*100:.0f}%  "
-              f"Realised=${balance:,.2f} ({sym}${net_pnl:,.2f})  "
-              f"Unrealised=${total_unreal:+,.0f}")
-        print(f"  Total equity: ${eq:,.2f}")
+        win_pnls  = [_net(t) for t in closed if _net(t) > 0]
+        loss_pnls = [_net(t) for t in closed if _net(t) <= 0]
+        avg_win   = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0.0
+        avg_loss  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
+        best_usd  = max(dolls) if dolls else 0.0
+        worst_usd = min(dolls) if dolls else 0.0
+        cum = 1.0; pk = 1.0; dd = 0.0
+        for t in closed:
+            cum *= (1 + _net(t)); pk = max(pk, cum); dd = max(dd, (pk-cum)/pk)
+
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        print(_row(f"Starting: ${STARTING:,.0f}   Realised: ${balance:,.2f}   "
+                   f"Unrealised: {'+' if total_unreal>=0 else ''}${total_unreal:,.0f}",
+                   f"Total equity: ${eq:,.2f}  ({pnl_sign}${total_pnl:,.2f})"))
+        print(_row(f"Trades: {n}   Wins: {wins}   Losses: {n-wins}   Win rate: {wr*100:.0f}%",
+                   f"Avg win: {avg_win*100:+.2f}%   Avg loss: {avg_loss*100:+.2f}%   Max DD: -{dd*100:.2f}%"))
+        print(_row(f"Best trade:  +${best_usd:,.0f}",
+                   f"Worst trade:  -${abs(worst_usd):,.0f}"))
     else:
-        print(f"  No closed trades yet   Starting: ${STARTING:,.0f}")
+        print(f"  No closed trades yet   Starting balance: ${STARTING:,.0f}")
     print()
-    print(f"  Refreshing every {INTERVAL}s — Ctrl+C to stop")
-    print("━" * W)
+
+    # ── Trades table ─────────────────────────────────────────────────────────
+    print(f"  {'─'*4} ALL TRADES  (newest first) {'─'*(TW - 32)}")
+    if not closed:
+        print("  No closed trades yet.")
+    else:
+        # Table header
+        TH = (f"  {'#':>4}  {'DIR':<6}  {'ENTRY':>12}  {'EXIT':>12}  "
+              f"{'PNL %':>8}  {'PNL $':>10}  {'BALANCE':>12}  "
+              f"{'REASON':<18}  {'LEVERAGE':>8}  {'CLOSED'}")
+        print(TH)
+        print("  " + "-" * (TW - 2))
+        running = STARTING
+        running_list = []
+        for d in dolls:
+            running += d
+            running_list.append(running)
+        for idx in range(n - 1, -1, -1):
+            t    = closed[idx]
+            d    = dolls[idx]
+            bal  = running_list[idx]
+            pct  = _net(t)
+            sign = "+" if pct >= 0 else ""
+            dsign= "+" if d >= 0 else ""
+            exit_t = t.get("exit_time", "")[:16].replace("T", " ")
+            reason = t.get("exit_reason", "").replace("_", " ")[:18]
+            lev    = t.get("leverage", 1)
+            print(f"  {idx+1:>4}  {t.get('direction','').upper():<6}  "
+                  f"${t.get('entry_price',0):>11,.2f}  ${t.get('exit_price',0):>11,.2f}  "
+                  f"{sign}{pct*100:>7.2f}%  {dsign}${abs(d):>9,.0f}  "
+                  f"${bal:>11,.2f}  {reason:<18}  {lev:>6}x    {exit_t}")
+    print()
+    print(f"  Refreshing every {INTERVAL}s   Ctrl+C to stop")
+    print("=" * TW)
 
 
 # ── CSV writers ───────────────────────────────────────────────────────────────
