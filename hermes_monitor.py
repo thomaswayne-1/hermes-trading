@@ -160,13 +160,16 @@ def render_terminal(state: dict, closed: list) -> None:
     bb      = float(hb.get("bb_pct",       0.5))
     atr     = float(hb.get("atr",          0))
     ob_imb  = float(hb.get("ob_imbalance", 0))
-    # Convert UTC heartbeat timestamp → local time for display
+    # Convert UTC heartbeat timestamp → local time; compute age
     _ts_raw = hb.get("ts", "")
+    ts = "?"
+    data_age_s = 0
     try:
         _dt = datetime.fromisoformat(_ts_raw)
         if _dt.tzinfo is None:
             _dt = _dt.replace(tzinfo=timezone.utc)
-        ts = _dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        ts = _dt.astimezone().strftime("%H:%M:%S")   # time only — same day as local
+        data_age_s = int((datetime.now(timezone.utc) - _dt).total_seconds())
     except Exception:
         ts = _ts_raw[:19].replace("T", " ")
 
@@ -208,6 +211,15 @@ def render_terminal(state: dict, closed: list) -> None:
     now_local = datetime.now().strftime("%H:%M:%S")
     stale_tag = f"  ⚠ STALE since {_cache['stale_since']}" if _cache["stale"] else ""
 
+    # Heartbeat freshness tag
+    if data_age_s <= 15:
+        age_tag = f" ({data_age_s}s)"
+    elif data_age_s <= 60:
+        age_tag = f" ⚠ {data_age_s}s old"
+    else:
+        _m, _s = data_age_s // 60, data_age_s % 60
+        age_tag = f" ⚠⚠ {_m}m{_s}s old"
+
     # ── Print ─────────────────────────────────────────────────────────────────
     print("\033[2J\033[H", end="")   # clear screen
     print("━" * W)
@@ -226,7 +238,7 @@ def render_terminal(state: dict, closed: list) -> None:
         status = "waiting"
     eq = balance + total_unreal
     sym = "+" if eq >= STARTING else ""
-    print(f"  {ts}   BTC ${price:,.2f}   RSI {rsi:.1f}")
+    print(f"  {ts}{age_tag}   BTC ${price:,.2f}   RSI {rsi:.1f}")
     print(f"  Status: {status}   closed={n}   balance=${eq:,.2f}  ({sym}${eq-STARTING:,.2f})")
     print()
 
@@ -420,7 +432,7 @@ def write_csvs(state: dict, closed: list) -> None:
         ["Stop loss",            f"-{sl}%"],
         ["Take profit",          f"+{tp}%"],
         ["Strategy version",     f"v{ver}"],
-        ["Last tick",            _age(ts)],
+        ["Last tick",            _age(hb.get("ts",""))],
         ["Consecutive failures", fails],
         ["Agent",                "Healthy" if fails == 0 else "Degraded"],
     ]
