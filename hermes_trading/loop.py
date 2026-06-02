@@ -407,7 +407,7 @@ class TradingLoop:
 
         # MACD reversal — only when profitable
         if raw_pnl > 0:
-            entry_macd = float(trade.get("entry_macd_hist", 0.0))
+            entry_macd = float(trade.get("entry_macd_hist") or 0.0)
             if direction == "long" and entry_macd > 0 and macd_hist < 0:
                 return "macd_reversal"
             if direction == "short" and entry_macd < 0 and macd_hist > 0:
