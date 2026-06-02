@@ -265,6 +265,7 @@ def render_terminal(state: dict, closed: list) -> None:
 
     eq        = balance + total_unreal
     total_pnl = eq - STARTING
+    eq_pnl_s  = f"+${total_pnl:,.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):,.2f}"
     now_local = datetime.now().strftime("%H:%M:%S")
     stale_tag = f"  ** STALE since {_cache['stale_since']} **" if _cache["stale"] else ""
 
@@ -279,9 +280,8 @@ def render_terminal(state: dict, closed: list) -> None:
     print(D)
 
     # ── Status bar ────────────────────────────────────────────────────────────
-    pnl_sign = "+" if total_pnl >= 0 else ""
     print(_row(f"BTC  ${price:,.2f}   RSI {rsi:.1f}   {ts}{age_tag}{stale_tag}",
-               f"Equity  ${eq:,.2f}  ({pnl_sign}${total_pnl:,.2f})"))
+               f"Equity  ${eq:,.2f}  ({eq_pnl_s})"))
     if open_trades:
         pos_str = "   ".join(
             f"{t.get('direction','').upper()} @ ${float(t.get('entry_price',0)):,.0f}"
@@ -377,10 +377,11 @@ def render_terminal(state: dict, closed: list) -> None:
         for t in closed:
             cum *= (1 + _net(t)); pk = max(pk, cum); dd = max(dd, (pk-cum)/pk)
 
-        pnl_sign = "+" if total_pnl >= 0 else ""
+        pnl_str = f"+${total_pnl:,.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):,.2f}"
+        unr_str = f"+${total_unreal:,.0f}" if total_unreal >= 0 else f"-${abs(total_unreal):,.0f}"
         print(_row(f"Starting: ${STARTING:,.0f}   Realised: ${balance:,.2f}   "
-                   f"Unrealised: {'+' if total_unreal>=0 else ''}${total_unreal:,.0f}",
-                   f"Total equity: ${eq:,.2f}  ({pnl_sign}${total_pnl:,.2f})"))
+                   f"Unrealised: {unr_str}",
+                   f"Total equity: ${eq:,.2f}  ({pnl_str})"))
         print(_row(f"Trades: {n}   Wins: {wins}   Losses: {n-wins}   Win rate: {wr*100:.0f}%",
                    f"Avg win: {avg_win*100:+.2f}%   Avg loss: {avg_loss*100:+.2f}%   Max DD: -{dd*100:.2f}%"))
         print(_row(f"Best trade:  +${best_usd:,.0f}",
@@ -409,15 +410,15 @@ def render_terminal(state: dict, closed: list) -> None:
             t    = closed[idx]
             d    = dolls[idx]
             bal  = running_list[idx]
-            pct  = _net(t)
-            sign = "+" if pct >= 0 else ""
-            dsign= "+" if d >= 0 else ""
+            pct    = _net(t)
+            pct_s  = f"+{pct*100:.2f}%" if pct >= 0 else f"-{abs(pct*100):.2f}%"
+            d_s    = f"+${d:,.0f}"      if d >= 0    else f"-${abs(d):,.0f}"
             exit_t = t.get("exit_time", "")[:16].replace("T", " ")
             reason = t.get("exit_reason", "").replace("_", " ")[:18]
             lev    = t.get("leverage", 1)
             print(f"  {idx+1:>4}  {t.get('direction','').upper():<6}  "
                   f"${t.get('entry_price',0):>11,.2f}  ${t.get('exit_price',0):>11,.2f}  "
-                  f"{sign}{pct*100:>7.2f}%  {dsign}${abs(d):>9,.0f}  "
+                  f"{pct_s:>9}  {d_s:>11}  "
                   f"${bal:>11,.2f}  {reason:<18}  {lev:>6}x    {exit_t}")
     print()
     print(f"  Refreshing every {INTERVAL}s   Ctrl+C to stop")
