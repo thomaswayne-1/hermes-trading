@@ -112,6 +112,18 @@ class TradingLoop:
         self._last_fast_cycle_at: int = 0
         self._tick_count: int = 0
 
+        # ── Whipsaw-gating state (coefficient hysteresis patch) ───────────────
+        # Consecutive bars where C > +c_enter_band or C < -c_enter_band.
+        # Used by _maybe_open_engine to enforce entry_persist.
+        self._bars_signal_long: int = 0
+        self._bars_signal_short: int = 0
+        # Per-trade consecutive bars where the flip condition has been met.
+        # Populated by _evaluate_exits; cleared by _close_trade.
+        # Also persisted in open_trades.json so redeploys don't reset counters.
+        self._bars_against: dict[str, int] = {}
+        # Tick index below which new entries are blocked after a coeff exit.
+        self._coeff_lockout_until: int = 0
+
         # Engine + guardrails
         initial_strategy = self._load_strategy()
         coef_cfg = initial_strategy.get("coefficient", {})
@@ -289,6 +301,19 @@ class TradingLoop:
 
         # ── Strategy config (shared) ──────────────────────────────────────────
         entry_cfg = strategy.get("entry", {})
+        gating_cfg = strategy.get("coefficient_gating", {})
+
+        # ── Update signal persistence counters (used by entry gate) ───────────
+        _c_enter_band = float(gating_cfg.get("c_enter_band", 0.15))
+        if C > _c_enter_band:
+            self._bars_signal_long  += 1
+            self._bars_signal_short  = 0
+        elif C < -_c_enter_band:
+            self._bars_signal_short += 1
+            self._bars_signal_long   = 0
+        else:
+            self._bars_signal_long  = 0
+            self._bars_signal_short = 0
 
         # ── EXIT logic ────────────────────────────────────────────────────────
         for trade in list(self._open_trades):
@@ -380,11 +405,22 @@ class TradingLoop:
             if raw_pnl >= r_multiple * vs_stop:
                 return "r_multiple_tp"
 
-            # Coefficient exits (flip + collapse)
-            coef_reason = evaluate_coefficient_exits(
+            # Coefficient exits (flip + collapse) — gated by hysteresis,
+            # persistence, and minimum hold (Change 1–3 of whipsaw patch).
+            _gating  = strategy.get("coefficient_gating", {})
+            _bars_held = self._tick_count - int(trade.get("entry_tick", self._tick_count))
+            coef_reason, new_bars_against = evaluate_coefficient_exits(
                 trade, current_price, float(snapshot["C"]),
-                tau_exit=float(strategy.get("coefficient", {}).get("tau_exit", 0.05)),
+                tau_exit    =float(strategy.get("coefficient", {}).get("tau_exit", 0.05)),
+                c_exit_band =float(_gating.get("c_exit_band",  0.10)),
+                min_hold_bars=int(_gating.get("min_hold_bars", 3)),
+                flip_persist =int(_gating.get("flip_persist",  3)),
+                bars_held   =_bars_held,
+                bars_against=self._bars_against.get(trade_id, 0),
             )
+            # Always update the counter — even when no exit fires, the
+            # accumulation (or reset) must be persisted for the next tick.
+            self._bars_against[trade_id] = new_bars_against
             if coef_reason:
                 return coef_reason
 
@@ -491,6 +527,9 @@ class TradingLoop:
             mfe = max(0.0, (entry_price - peak) / entry_price)
             mae = max(0.0, (trough - entry_price) / entry_price)
 
+        # bars_held for churn attribution and the churn_rate metric
+        bars_held_at_close = self._tick_count - int(trade.get("entry_tick", self._tick_count))
+
         closed = {
             **trade,
             "exit_price":       current_price,
@@ -506,13 +545,15 @@ class TradingLoop:
             "mae":              round(mae, 6),
             "holding_minutes":  round(holding_min, 2),
             "funding_at_exit":  round(funding_rate, 6),
+            "bars_held":        bars_held_at_close,
             "closed":           True,
         }
 
         log.info(
-            "EXIT | reason=%s dir=%s price=%.2f gross=%.3f%% net=%.3f%% lev=%.2fx id=%s",
+            "EXIT | reason=%s dir=%s price=%.2f gross=%.3f%% net=%.3f%% "
+            "lev=%.2fx bars=%d id=%s",
             reason, direction, current_price,
-            gross_lev * 100, net_lev * 100, lev, trade_id,
+            gross_lev * 100, net_lev * 100, lev, bars_held_at_close, trade_id,
         )
 
         try:
@@ -521,6 +562,25 @@ class TradingLoop:
             pass
         self._peak_prices.pop(trade_id, None)
         self._trough_prices.pop(trade_id, None)
+        # Clean up whipsaw-gating state for this trade
+        self._bars_against.pop(trade_id, None)
+
+        # Re-entry lockout: block new coefficient entries for reentry_lock_bars
+        # after a coefficient exit.  Never applied after stop-loss or take-profit
+        # so genuine re-entries after clean exits are not penalised.
+        if reason in ("coefficient_flip", "coefficient_collapse"):
+            lock_bars = int(
+                strategy.get("coefficient_gating", {}).get("reentry_lock_bars", 5)
+            )
+            self._coeff_lockout_until = max(
+                self._coeff_lockout_until,
+                self._tick_count + lock_bars,
+            )
+            log.debug(
+                "COEFF LOCKOUT | entry blocked until tick %d (lock_bars=%d)",
+                self._coeff_lockout_until, lock_bars,
+            )
+
         self._save_open_trades()
 
         self._append_trade(closed)
@@ -575,12 +635,38 @@ class TradingLoop:
     ) -> None:
         C = float(snapshot["C"])
         K = float(snapshot["K"])
-        coef_cfg = strategy.get("coefficient", {})
-        siz_cfg  = strategy.get("sizing", {})
-        lev_cfg  = strategy.get("leverage", {})
-        tau_enter = float(coef_cfg.get("tau_enter", 0.12))
+        coef_cfg   = strategy.get("coefficient", {})
+        siz_cfg    = strategy.get("sizing", {})
+        lev_cfg    = strategy.get("leverage", {})
+        gating_cfg = strategy.get("coefficient_gating", {})
 
-        if abs(C) <= tau_enter:
+        # Hysteresis entry band (Change 1 / Change 5 of whipsaw patch).
+        # c_enter_band replaces the raw tau_enter for the hard entry gate.
+        # tau_enter still governs the Kelly sizing floor_threshold.
+        tau_enter    = float(coef_cfg.get("tau_enter", 0.12))
+        c_enter_band = float(gating_cfg.get("c_enter_band", 0.15))
+        entry_persist = int(gating_cfg.get("entry_persist", 2))
+
+        # ── Gate 1: magnitude threshold ───────────────────────────────────────
+        if abs(C) <= c_enter_band:
+            return
+
+        # ── Gate 2: entry persistence (Change 5) ─────────────────────────────
+        # Require C to have been above the band for entry_persist consecutive
+        # bars so a single noisy spike can't open a position.
+        if C > c_enter_band and self._bars_signal_long < entry_persist:
+            return
+        if C < -c_enter_band and self._bars_signal_short < entry_persist:
+            return
+
+        # ── Gate 3: re-entry lockout (Change 4) ──────────────────────────────
+        # After a coefficient exit, block new entries for reentry_lock_bars
+        # ticks to break the churn loop.
+        if self._tick_count < self._coeff_lockout_until:
+            log.debug(
+                "ENTRY BLOCKED | coeff lockout active (tick %d < %d)",
+                self._tick_count, self._coeff_lockout_until,
+            )
             return
 
         # Cooldown
@@ -628,8 +714,9 @@ class TradingLoop:
         )
 
         direction = "long" if C > 0 else "short"
+        trade_id  = f"T{int(now_ts)}"
         trade = {
-            "id":                  f"T{int(now_ts)}",
+            "id":                  trade_id,
             "asset":               self.asset,
             "entry_price":         current_price,
             "entry_time":          now_iso,
@@ -652,11 +739,14 @@ class TradingLoop:
             "entry_rsi":           round(rsi,        4),
             "entry_bb_pct":        round(bb_pct,     4),
             "entry_ob_imb":        round(ob_imbalance, 4),
+            # Tick index at entry — used to compute bars_held for min_hold gate
+            "entry_tick":          self._tick_count,
         }
 
         self._open_trades.append(trade)
-        self._peak_prices[trade["id"]]   = current_price
-        self._trough_prices[trade["id"]] = current_price
+        self._peak_prices[trade_id]   = current_price
+        self._trough_prices[trade_id] = current_price
+        self._bars_against[trade_id]  = 0   # initialise flip-persistence counter
         self._last_entry_time = now_ts
         self._save_open_trades()
 
@@ -875,9 +965,11 @@ class TradingLoop:
     def _save_open_trades(self) -> None:
         """Persist open positions + peak/trough prices to disk so they survive restarts."""
         snapshot = {
-            "open_trades":   self._open_trades,
-            "peak_prices":   self._peak_prices,
-            "trough_prices": self._trough_prices,
+            "open_trades":         self._open_trades,
+            "peak_prices":         self._peak_prices,
+            "trough_prices":       self._trough_prices,
+            "bars_against":        self._bars_against,
+            "coeff_lockout_until": self._coeff_lockout_until,
         }
         with open(self.open_trades_file, "w") as f:
             json.dump(snapshot, f)
@@ -891,6 +983,9 @@ class TradingLoop:
             self._open_trades   = data.get("open_trades", [])
             self._peak_prices   = {k: float(v) for k, v in data.get("peak_prices", {}).items()}
             self._trough_prices = {k: float(v) for k, v in data.get("trough_prices", {}).items()}
+            # Restore whipsaw-gating state so persistence counters survive redeploys
+            self._bars_against        = {k: int(v) for k, v in data.get("bars_against", {}).items()}
+            self._coeff_lockout_until = int(data.get("coeff_lockout_until", 0))
             if self._open_trades:
                 log.info(
                     "RESTORED %d open trade(s) from disk: %s",
@@ -899,9 +994,11 @@ class TradingLoop:
                 )
         except Exception as exc:
             log.warning("Could not restore open trades (starting fresh): %s", exc)
-            self._open_trades   = []
-            self._peak_prices   = {}
-            self._trough_prices = {}
+            self._open_trades         = []
+            self._peak_prices         = {}
+            self._trough_prices       = {}
+            self._bars_against        = {}
+            self._coeff_lockout_until = 0
 
     async def _startup_restore(self) -> None:
         """

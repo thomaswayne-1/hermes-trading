@@ -83,3 +83,56 @@ def regime_ic(closed_trades: list[dict], regime: str, window: int = 40, min_trad
     """IC restricted to trades that occurred in a specific regime."""
     filtered = [t for t in closed_trades if t.get("entry_regime") == regime]
     return block_ic(filtered, window, min_trades)
+
+
+# ── Churn metrics (whipsaw-gating patch) ─────────────────────────────────────
+
+_COEFF_EXIT_REASONS = frozenset({"coefficient_flip", "coefficient_collapse"})
+
+
+def churn_metrics(
+    closed_trades: list[dict],
+    window: int = 40,
+    fee_roundtrip: float = 0.001,
+) -> dict:
+    """
+    Compute churn-rate and average hold bars over the most recent *window*
+    closed trades.
+
+    churn_rate  — fraction of trades that are coefficient exits where the
+                  |entry→exit price move| < fee_roundtrip (sub-fee-move exits).
+    avg_hold_bars — mean bars_held over the window (0 if field absent).
+    coeff_exit_rate — fraction of trades exited by any coefficient reason.
+
+    Returns a dict with keys: churn_rate, avg_hold_bars, coeff_exit_rate, n.
+    """
+    recent = [t for t in closed_trades if t.get("closed")][-window:]
+    n = len(recent)
+    if n == 0:
+        return {"churn_rate": 0.0, "avg_hold_bars": 0.0, "coeff_exit_rate": 0.0, "n": 0}
+
+    sub_fee_count    = 0
+    coeff_exit_count = 0
+    hold_bars_list: list[float] = []
+
+    for t in recent:
+        reason = t.get("exit_reason", "")
+        if reason in _COEFF_EXIT_REASONS:
+            coeff_exit_count += 1
+            ep = float(t.get("entry_price", 0) or 0)
+            xp = float(t.get("exit_price",  0) or 0)
+            if ep > 0 and xp > 0 and abs(xp - ep) / ep < fee_roundtrip:
+                sub_fee_count += 1
+
+        bh = t.get("bars_held")
+        if bh is not None:
+            hold_bars_list.append(float(bh))
+
+    avg_hold = sum(hold_bars_list) / len(hold_bars_list) if hold_bars_list else 0.0
+
+    return {
+        "churn_rate":       sub_fee_count    / n,
+        "avg_hold_bars":    avg_hold,
+        "coeff_exit_rate":  coeff_exit_count / n,
+        "n":                n,
+    }

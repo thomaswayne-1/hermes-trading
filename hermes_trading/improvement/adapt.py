@@ -131,6 +131,140 @@ def update_r_multiple(
     return max(bounds[0], min(bounds[1], new))
 
 
+# ── Whipsaw-gating parameter updates (6 new scalars) ─────────────────────────
+#
+# Priority when churn_rate is high: raise c_exit_band first, then flip_persist,
+# then min_hold_bars.  This matches the fallback logic in reflect.py.
+#
+# INVARIANT: c_exit_band < c_enter_band at all times.
+# Enforced in update_c_exit_band — the clamping happens in code, not just in
+# the prompt, so the deterministic fallback can never violate it either.
+
+def update_c_enter_band(
+    current: float,
+    *,
+    churn_rate: float,
+    avg_hold_bars: float,
+    step: float = 0.02,
+    bounds: tuple[float, float] = (0.08, 0.30),
+) -> float:
+    """
+    If churn_rate is high AND avg_hold is short, tighten c_enter_band so
+    fewer near-zero signals open trades.  If trade frequency has become
+    very low (avg_hold high + churn low), loosen slightly.
+    """
+    if churn_rate > 0.25 and avg_hold_bars < 2.0:
+        new = current + step
+    elif churn_rate < 0.05 and avg_hold_bars > 5.0:
+        new = current - step
+    else:
+        new = current
+    return max(bounds[0], min(bounds[1], new))
+
+
+def update_c_exit_band(
+    current: float,
+    *,
+    churn_rate: float,
+    c_enter_band: float,
+    step: float = 0.02,
+    bounds: tuple[float, float] = (0.05, 0.25),
+) -> float:
+    """
+    Primary anti-churn lever.  If churn is high, widen the exit band so
+    small reversals don't trigger flips.  Always enforces
+    c_exit_band < c_enter_band (INVARIANT).
+    """
+    if churn_rate > 0.20:
+        new = current + step
+    elif churn_rate < 0.03:
+        new = current - step
+    else:
+        new = current
+    new = max(bounds[0], min(bounds[1], new))
+    # Enforce invariant: exit band must be strictly below enter band
+    new = min(new, c_enter_band - 0.02)
+    return max(bounds[0], new)
+
+
+def update_flip_persist(
+    current: int,
+    *,
+    churn_rate: float,
+    step: int = 1,
+    bounds: tuple[int, int] = (1, 6),
+) -> int:
+    """
+    If churn is still high after c_exit_band adjustment, require more
+    consecutive confirming bars.
+    """
+    if churn_rate > 0.25:
+        new = current + step
+    elif churn_rate < 0.05:
+        new = current - step
+    else:
+        new = current
+    return max(bounds[0], min(bounds[1], new))
+
+
+def update_min_hold_bars(
+    current: int,
+    *,
+    churn_rate: float,
+    avg_hold_bars: float,
+    step: int = 1,
+    bounds: tuple[int, int] = (1, 10),
+) -> int:
+    """
+    If avg_hold is shorter than min_hold (exits happening at the floor),
+    raise the floor.  Only tighten if churn is low and holds are long.
+    """
+    if churn_rate > 0.20 or avg_hold_bars < float(current) + 0.5:
+        new = current + step
+    elif churn_rate < 0.03 and avg_hold_bars > float(current) * 3:
+        new = current - step
+    else:
+        new = current
+    return max(bounds[0], min(bounds[1], new))
+
+
+def update_reentry_lock_bars(
+    current: int,
+    *,
+    churn_rate: float,
+    step: int = 1,
+    bounds: tuple[int, int] = (0, 15),
+) -> int:
+    """Widen lockout when churn is still present; narrow when churn is gone."""
+    if churn_rate > 0.20:
+        new = current + step
+    elif churn_rate < 0.03:
+        new = current - step
+    else:
+        new = current
+    return max(bounds[0], min(bounds[1], new))
+
+
+def update_entry_persist(
+    current: int,
+    *,
+    churn_rate: float,
+    step: int = 1,
+    bounds: tuple[int, int] = (1, 5),
+) -> int:
+    """
+    Require more sustained conviction at entry when churn is high.
+    Lighter than flip_persist — quicker entries than exits.
+    """
+    if churn_rate > 0.25:
+        new = current + step
+    elif churn_rate < 0.03:
+        new = current - step
+    else:
+        new = current
+    return max(bounds[0], min(bounds[1], new))
+
+
 def update_lambda_kelly(
     current: float,
     *,

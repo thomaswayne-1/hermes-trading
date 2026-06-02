@@ -17,6 +17,22 @@ coefficient:
   tau_enter: 0.12
   tau_exit: 0.05
 
+# ── Whipsaw-gating (Change 1–5) ───────────────────────────────────────────────
+# Hysteresis band, flip persistence, minimum hold, re-entry lockout, and entry
+# persistence.  All six are exposed to the tuner; see improvement/adapt.py.
+# INVARIANT enforced in code: c_exit_band < c_enter_band at all times.
+coefficient_gating:
+  c_enter_band: 0.15        # |C| must exceed this to open a position
+  c_exit_band: 0.10         # C must cross past -/+ this to trigger a flip exit
+  flip_persist: 3           # consecutive bars flip condition must hold before exit fires
+  min_hold_bars: 3          # bars since entry before any coefficient exit may fire
+  reentry_lock_bars: 5      # bars blocked after a coefficient exit (not after SL/TP)
+  entry_persist: 2          # consecutive bars |C| > c_enter_band required to enter
+
+# ── Churn monitor ─────────────────────────────────────────────────────────────
+churn_monitor:
+  fee_roundtrip: 0.001      # 0.10% — classifies sub-fee-move exits as churn
+
 # ── Sizing (Part 2) ───────────────────────────────────────────────────────────
 sizing:
   lambda_kelly: 0.35

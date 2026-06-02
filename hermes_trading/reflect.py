@@ -84,12 +84,31 @@ def append_hypothesis(hypothesis: dict) -> None:
 #  Fallback: deterministic reflection                                 #
 # ------------------------------------------------------------------ #
 
+def _compute_churn(trades: list[dict], fee_roundtrip: float = 0.001) -> float:
+    """Fraction of coefficient exits with |price move| < fee_roundtrip."""
+    _COEFF = {"coefficient_flip", "coefficient_collapse"}
+    n = len(trades)
+    if n == 0:
+        return 0.0
+    sub_fee = sum(
+        1 for t in trades
+        if t.get("exit_reason") in _COEFF
+        and float(t.get("entry_price") or 0) > 0
+        and abs(float(t.get("exit_price") or 0) - float(t.get("entry_price") or 0))
+           / float(t.get("entry_price") or 1) < fee_roundtrip
+    )
+    return sub_fee / n
+
+
 def reflect_fallback(strategy: dict, goal: dict, trades: list[dict]) -> tuple[dict, dict]:
     """
     Deterministic reflection covering all strategy variables.
     Checks conditions in priority order and changes exactly ONE variable.
 
     Priority order:
+      0a. Churn too high (sub-fee coeff exits)  → raise c_exit_band
+      0b. Churn still high after prior cycle     → raise flip_persist
+      0c. Churn still high + long holds          → raise min_hold_bars
       1.  Drawdown too high             → tighten stop_loss_pct
       2.  Leverage too aggressive       → reduce leverage_base
       3.  RSI exits before TP (longs)   → raise long_rsi_exit
@@ -139,6 +158,43 @@ def reflect_fallback(strategy: dict, goal: dict, trades: list[dict]) -> tuple[di
     old_val     = None
     new_val     = None
     reason      = ""
+
+    churn_rate = _compute_churn(trades)
+    gcfg = strategy.setdefault("coefficient_gating", {})
+
+    # ── 0a. Churn too high — raise c_exit_band (primary lever) ──────────────
+    if churn_rate > 0.20:
+        old_val = float(gcfg.get("c_exit_band", 0.10))
+        c_enter = float(gcfg.get("c_enter_band", 0.15))
+        new_val = round(min(old_val + 0.02, c_enter - 0.02, 0.25), 4)
+        gcfg["c_exit_band"] = new_val
+        changed_var = "coefficient_gating.c_exit_band"
+        reason = (
+            f"Churn rate {churn_rate:.0%} — too many sub-fee-move coefficient exits. "
+            f"Raising c_exit_band {old_val} → {new_val} to widen the hysteresis dead zone."
+        )
+
+    # ── 0b. Churn still high — raise flip_persist ────────────────────────────
+    elif churn_rate > 0.15:
+        old_val = int(gcfg.get("flip_persist", 3))
+        new_val = min(old_val + 1, 6)
+        gcfg["flip_persist"] = new_val
+        changed_var = "coefficient_gating.flip_persist"
+        reason = (
+            f"Churn rate {churn_rate:.0%} — still elevated after band adjustment. "
+            f"Raising flip_persist {old_val} → {new_val} to require more confirming bars."
+        )
+
+    # ── 0c. Churn present — raise min_hold_bars ──────────────────────────────
+    elif churn_rate > 0.10:
+        old_val = int(gcfg.get("min_hold_bars", 3))
+        new_val = min(old_val + 1, 10)
+        gcfg["min_hold_bars"] = new_val
+        changed_var = "coefficient_gating.min_hold_bars"
+        reason = (
+            f"Churn rate {churn_rate:.0%} — same-minute close pattern detected. "
+            f"Raising min_hold_bars {old_val} → {new_val} to enforce minimum position age."
+        )
 
     # ── 1. Drawdown too high ──────────────────────────────────────────────────
     if max_dd > goal.get("max_drawdown", 0.08):
@@ -319,6 +375,22 @@ def reflect_hermes(strategy: dict, goal: dict, trades: list[dict]) -> tuple[dict
     recent_trades = trades[-HERMES_TRADE_WINDOW:]
     score_before = score(recent_trades, goal)
 
+    # Compute churn metrics for the prompt
+    churn_rate = _compute_churn(recent_trades)
+    coeff_exits = [t for t in recent_trades
+                   if t.get("exit_reason") in ("coefficient_flip", "coefficient_collapse")]
+    coeff_exit_rate = len(coeff_exits) / max(1, len(recent_trades))
+    bars_held_vals  = [t.get("bars_held", 0) for t in recent_trades if t.get("bars_held")]
+    avg_hold_bars   = sum(bars_held_vals) / len(bars_held_vals) if bars_held_vals else 0.0
+    win_by_reason   = {}
+    for t in recent_trades:
+        r = t.get("exit_reason", "other")
+        win_by_reason.setdefault(r, {"n": 0, "wins": 0})
+        win_by_reason[r]["n"] += 1
+        if t.get("pnl_pct_net", t.get("pnl_pct", 0)) > 0:
+            win_by_reason[r]["wins"] += 1
+    win_rate_by_reason = {r: round(v["wins"] / v["n"], 3) for r, v in win_by_reason.items()}
+
     prompt = f"""You are the brain of a self-improving trading agent. Your job is to reflect
 on recent trade outcomes and propose exactly ONE change to the strategy.
 
@@ -333,13 +405,35 @@ RECENT TRADES (last {len(recent_trades)}):
 
 CURRENT SCORE: {score_before:.4f} (range -1.0 to +1.0)
 
+CHURN ANALYSIS (whipsaw diagnostics):
+  churn_rate:       {churn_rate:.2%}  (fraction of coefficient exits with |price move| < 0.10% fee)
+  coeff_exit_rate:  {coeff_exit_rate:.2%}  (fraction of all exits that were coefficient-based)
+  avg_hold_bars:    {avg_hold_bars:.1f}  (mean bars held per trade)
+  win_rate_by_reason: {json.dumps(win_rate_by_reason)}
+
+WHIPSAW-GATING PARAMETERS (can be tuned — all six are in coefficient_gating):
+  c_enter_band      [{strategy.get('coefficient_gating', {}).get('c_enter_band', 0.15)}]  bounds [0.08, 0.30]  — entry signal threshold
+  c_exit_band       [{strategy.get('coefficient_gating', {}).get('c_exit_band', 0.10)}]  bounds [0.05, 0.25]  — flip exit threshold (MUST stay < c_enter_band)
+  flip_persist      [{strategy.get('coefficient_gating', {}).get('flip_persist', 3)}]    bounds [1, 6]        — bars the flip must hold
+  min_hold_bars     [{strategy.get('coefficient_gating', {}).get('min_hold_bars', 3)}]    bounds [1, 10]       — minimum bars before coeff exit
+  reentry_lock_bars [{strategy.get('coefficient_gating', {}).get('reentry_lock_bars', 5)}]  bounds [0, 15]       — lock after coeff exit
+  entry_persist     [{strategy.get('coefficient_gating', {}).get('entry_persist', 2)}]    bounds [1, 5]        — bars of sustained signal to enter
+
+INVARIANT: coefficient_gating.c_exit_band < coefficient_gating.c_enter_band at all times.
+If you propose raising c_exit_band, ensure new value < c_enter_band − 0.02.
+If you propose raising c_enter_band, do not move it below current c_exit_band + 0.02.
+You may move both in the same direction in pending_hypotheses but only ONE per turn.
+
+If churn_rate > 0.20: prioritise raising c_exit_band, then flip_persist, then min_hold_bars.
+If churn_rate < 0.05 and avg_hold_bars < 1: consider lowering min_hold_bars or entry_persist.
+
 Instructions:
-1. Analyse the trades. Identify what's working and what isn't.
-2. Generate 1–3 hypotheses. Each must name exactly ONE variable in the strategy and predict the score direction.
+1. Analyse the trades and churn diagnostics. Identify what's working and what isn't.
+2. Generate 1–3 hypotheses. Each must name exactly ONE variable and predict the score direction.
 3. Pick the hypothesis with the highest confidence.
 4. Respond ONLY with a JSON object in this exact format:
 {{
-  "changed_variable": "<dot.path to variable e.g. entry.threshold or stop_loss_pct>",
+  "changed_variable": "<dot.path e.g. coefficient_gating.c_exit_band or stop_loss_pct>",
   "old_value": <current value>,
   "new_value": <proposed value>,
   "reasoning": "<one paragraph explaining why>",

@@ -19,13 +19,19 @@ from typing import Any
 
 import yaml
 
-from .attribution import block_ic
+from .attribution import block_ic, churn_metrics
 from .adapt import (
     update_block_weights,
     update_tau_enter,
     update_lambda_kelly,
     update_k_sl,
     update_r_multiple,
+    update_c_enter_band,
+    update_c_exit_band,
+    update_flip_persist,
+    update_min_hold_bars,
+    update_reentry_lock_bars,
+    update_entry_persist,
 )
 from .guardrails import (
     current_drawdown,
@@ -96,10 +102,13 @@ def run_fast_cycle(
     sharpe = rolling_sharpe(closed_trades, window=window)
     hit_rate = sum(1 for t in recent if t.get("pnl_pct_net", t.get("pnl_pct", 0)) > 0) / len(recent) if recent else 0.0
 
-    coef_cfg = strategy.get("coefficient", {})
-    siz_cfg  = strategy.get("sizing", {})
-    exit_cfg = strategy.get("exits", {})
+    coef_cfg    = strategy.get("coefficient", {})
+    siz_cfg     = strategy.get("sizing", {})
+    exit_cfg    = strategy.get("exits", {})
+    gating_cfg  = strategy.get("coefficient_gating", {})
+    churn_cfg   = strategy.get("churn_monitor", {})
 
+    # ── Existing scalars ──────────────────────────────────────────────────────
     old_tau_enter = float(coef_cfg.get("tau_enter", 0.12))
     old_lambda    = float(siz_cfg.get("lambda_kelly", 0.35))
     old_k_sl      = float(exit_cfg.get("k_sl", 1.0))
@@ -132,6 +141,31 @@ def run_fast_cycle(
         stop_pct_p50 = float(strategy.get("stop_loss_pct", 0.5)) / 100.0
         new_r_mult = update_r_multiple(old_r_mult, mfe_p50=mfe_p50, stop_pct_p50=stop_pct_p50)
 
+    # ── Whipsaw-gating scalars (6 new params) ─────────────────────────────────
+    fee_rt = float(churn_cfg.get("fee_roundtrip", 0.001))
+    churn  = churn_metrics(closed_trades, window=window, fee_roundtrip=fee_rt)
+    cr     = churn["churn_rate"]
+    ahb    = churn["avg_hold_bars"]
+
+    old_c_enter   = float(gating_cfg.get("c_enter_band",      0.15))
+    old_c_exit    = float(gating_cfg.get("c_exit_band",       0.10))
+    old_fp        = int(  gating_cfg.get("flip_persist",      3))
+    old_mh        = int(  gating_cfg.get("min_hold_bars",     3))
+    old_rl        = int(  gating_cfg.get("reentry_lock_bars", 5))
+    old_ep        = int(  gating_cfg.get("entry_persist",     2))
+
+    new_c_enter = update_c_enter_band(old_c_enter, churn_rate=cr, avg_hold_bars=ahb)
+    new_c_exit  = update_c_exit_band( old_c_exit,  churn_rate=cr, c_enter_band=new_c_enter)
+    new_fp      = update_flip_persist(old_fp,       churn_rate=cr)
+    new_mh      = update_min_hold_bars(old_mh,      churn_rate=cr, avg_hold_bars=ahb)
+    new_rl      = update_reentry_lock_bars(old_rl,  churn_rate=cr)
+    new_ep      = update_entry_persist(old_ep,      churn_rate=cr)
+
+    log.info(
+        "fast_cycle | churn_rate=%.2f avg_hold_bars=%.1f coeff_exit_rate=%.2f n=%d",
+        cr, ahb, churn["coeff_exit_rate"], churn["n"],
+    )
+
     # Compose the change record
     old_version = strategy.get("version", "00")
     new_version = _bump_version(old_version)
@@ -143,18 +177,32 @@ def run_fast_cycle(
         "block_ic":     {k: round(v, 4) for k, v in ics.items()},
         "weights_before": prior,
         "weights_after":  {k: round(v, 4) for k, v in new.items()},
-        "scalars_changed": {
-            k: [round(o, 4), round(n, 4)]
-            for k, (o, n) in [
-                ("tau_enter",    (old_tau_enter, new_tau_enter)),
-                ("lambda_kelly", (old_lambda, new_lambda)),
-                ("k_sl",         (old_k_sl, new_k_sl)),
-                ("r_multiple",   (old_r_mult, new_r_mult)),
-            ]
-            if abs(o - n) > 1e-6
+        "churn_metrics": {
+            "churn_rate":      round(cr, 4),
+            "avg_hold_bars":   round(ahb, 2),
+            "coeff_exit_rate": round(churn["coeff_exit_rate"], 4),
         },
-        "reasoning":    f"Block IC: {ics}. Drawdown {dd:.4f}. Sharpe {sharpe:.3f}. "
-                        f"Hit rate {hit_rate:.2%} over {len(recent)} trades.",
+        "scalars_changed": {
+            k: [round(float(o), 4), round(float(n_), 4)]
+            for k, (o, n_) in [
+                ("tau_enter",         (old_tau_enter, new_tau_enter)),
+                ("lambda_kelly",      (old_lambda,    new_lambda)),
+                ("k_sl",              (old_k_sl,      new_k_sl)),
+                ("r_multiple",        (old_r_mult,    new_r_mult)),
+                ("c_enter_band",      (old_c_enter,   new_c_enter)),
+                ("c_exit_band",       (old_c_exit,    new_c_exit)),
+                ("flip_persist",      (old_fp,        new_fp)),
+                ("min_hold_bars",     (old_mh,        new_mh)),
+                ("reentry_lock_bars", (old_rl,        new_rl)),
+                ("entry_persist",     (old_ep,        new_ep)),
+            ]
+            if abs(float(o) - float(n_)) > 1e-6
+        },
+        "reasoning":    (
+            f"Block IC: {ics}. Drawdown {dd:.4f}. Sharpe {sharpe:.3f}. "
+            f"Hit rate {hit_rate:.2%} over {len(recent)} trades. "
+            f"Churn rate {cr:.2%}, avg hold {ahb:.1f} bars."
+        ),
     }
 
     # Shadow validation
@@ -182,6 +230,18 @@ def run_fast_cycle(
     strategy.setdefault("exits",       {})["k_sl"]         = new_k_sl
     strategy.setdefault("exits",       {})["r_multiple"]   = new_r_mult
     strategy.setdefault("regime", {}).setdefault("weights", {})[regime_to_update] = new
+
+    # Whipsaw-gating params — update only if a change was computed
+    g = strategy.setdefault("coefficient_gating", {})
+    g["c_enter_band"]      = round(new_c_enter, 4)
+    g["c_exit_band"]       = round(new_c_exit,  4)
+    g["flip_persist"]      = new_fp
+    g["min_hold_bars"]     = new_mh
+    g["reentry_lock_bars"] = new_rl
+    g["entry_persist"]     = new_ep
+    # Re-enforce invariant after write (belt-and-suspenders)
+    if g["c_exit_band"] >= g["c_enter_band"]:
+        g["c_exit_band"] = round(g["c_enter_band"] - 0.02, 4)
 
     with open(strategy_file, "w") as f:
         yaml.dump(strategy, f, default_flow_style=False, sort_keys=False)
